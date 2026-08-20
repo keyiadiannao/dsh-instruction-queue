@@ -935,11 +935,21 @@ export function apply(ctx: any, config: Config): void {
         } else {
           message += ` ${remaining} obligation(s) remain (phase ${next.state.phase}).`
           // PUSH INVERSION: when the plan still has dispatchable work and the
-          // queue is ready/idle, the plan drives execution itself — inject the
-          // next segment's execution envelope and wake the agent loop, instead
-          // of waiting for the user to pull via iq_execute_next again. The
-          // envelope's source is plugin kind, so autoCapture never captures it.
-          pushNextSegment(exec.agent, next.state)
+          // queue is ready/idle, the plan drives execution itself — dispatch the
+          // next segment (TASK_DISPATCHED event), inject the execution envelope
+          // into the agent loop, and wake it, instead of waiting for the user to
+          // pull via iq_execute_next again. The envelope's source is plugin kind,
+          // so autoCapture never captures it.
+          const t = nextDispatchable(next.state)
+          if (t !== null && next.state.active_task_id === null) {
+            const aId = `A${t.attempts.length + 1}`
+            const dispatchEvt: IQEvent = {
+              kind: 'TASK_DISPATCHED', seq: -1, run_id: sessionId, ts: nowIso(),
+              task_id: t.task_id, attempt_id: aId,
+            }
+            const afterDispatch = commitEvents(sessionId, next.events, [dispatchEvt])
+            pushEnvelope(exec.agent, afterDispatch.state, t.task_id, aId)
+          }
         }
         return {
           ok: true,
@@ -1052,37 +1062,36 @@ function isControlUtterance(text: string): boolean {
 }
 
 /**
- * PUSH INVERSION: after a segment reconciles, if the plan still owns
- * dispatchable, unexecuted work, drive execution forward by injecting the next
- * execution envelope into the agent loop and waking it — no user message
- * required. This is the design's outer loop: the plan is the executor of
- * record; the agent is a per-segment worker.
+ * PUSH INVERSION: inject the dispatch envelope into the agent loop and wake it.
+ * The caller has already written the TASK_DISPATCHED event and holds the
+ * dispatch state; this only builds the model-facing envelope and wakes the
+ * loop. The plan is the executor of record; the agent is a per-segment worker.
  */
-function pushNextSegment(
+function pushEnvelope(
   agent: ExecCtx['agent'],
   state: RunState,
+  taskId: string,
+  attemptId: string,
 ): void {
   if (agent === undefined) return
   if (typeof agent.followup !== 'function') return
-  if (state.active_task_id !== null) return // invariant #7: one owner at a time
-  const next = nextDispatchable(state)
-  if (next === null) return
-  // The envelope is a plugin-authored prompt the agent executes as its next
-  // segment. Same shape as iq_execute_next's envelope so behavior is uniform.
-  const taskText = next.task
-  const criteria = next.acceptance_criteria.map((c, i) => `${i + 1}. ${c.text}`).join('\n')
-  const text = `[Instructions Queue] Execute the next approved segment (${next.task_id}).\n\n`
-    + `TASK: ${taskText}\n`
-    + `intent: ${next.intent_type} | targets: ${next.targets.join(', ')} | side-effect: ${next.side_effect_class}\n\n`
+  const t = state.tasks.find((x) => x.task_id === taskId)
+  if (t === undefined) return
+  const criteria = t.acceptance_criteria.map((c, i) => `${i + 1}. ${c.text}`).join('\n')
+  const text = `[Instructions Queue] Execute the approved segment (${taskId}).\n\n`
+    + `TASK: ${t.task}\n`
+    + `intent: ${t.intent_type} | targets: ${t.targets.join(', ')} | side-effect: ${t.side_effect_class}\n\n`
     + `ACCEPTANCE CRITERIA:\n${criteria}\n\n`
-    + 'Execute exactly this segment in the main session. Do NOT advance other queue tasks. '
-    + `After executing, report the result via iq_reconcile (task_id "${next.task_id}", e.g. attempt "A${next.attempts.length + 1}").`
+    + `This segment has ALREADY BEEN DISPATCHED by the plan (attempt ${attemptId}). `
+    + 'Do NOT call iq_execute_next or iq_execute again — the dispatch already happened. '
+    + 'Execute exactly this task in the main session; do not advance other queue tasks. '
+    + `When the task is done, call iq_reconcile ONCE with { task_id: "${taskId}", attempt_id: "${attemptId}", result_summary, evidence, criteria }.`
   agent.followup({
     content: [{ type: 'text', text }],
     source: { kind: 'plugin', plugin: 'dsh-instruction-queue', execution: true },
   })
   // eslint-disable-next-line no-console
-  console.log(`[dsh-instruction-queue] push: dispatched execution envelope for ${next.task_id} to the agent`)
+  console.log(`[dsh-instruction-queue] push: dispatched envelope ${taskId} (${attemptId}) to the agent`)
 }
 
 /**
