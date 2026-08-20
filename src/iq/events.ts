@@ -177,6 +177,12 @@ export interface RecoveryRequired extends EventMeta {
   note: string
 }
 
+/** The queue entered blocked state (e.g. final coverage audit failed). */
+export interface QueueBlocked extends EventMeta {
+  kind: 'QUEUE_BLOCKED'
+  note: string
+}
+
 /** The run completed: every approved obligation resolved. */
 export interface RunCompleted extends EventMeta {
   kind: 'RUN_COMPLETED'
@@ -223,5 +229,6 @@ export type IQEvent =
   | TaskProposalApproved
   | TaskProposalRejected
   | RecoveryRequired
+  | QueueBlocked
   | RunCompleted
   | RunAborted

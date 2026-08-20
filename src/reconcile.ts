@@ -18,6 +18,7 @@ import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { resolveTarget } from './compile.ts'
 import type { Config } from './index.ts'
 import type { EvidenceEvent } from './iq/events.ts'
+import { validateReconcileOutput } from './iq/schema.ts'
 import type { Attempt, RunState, Task } from './iq/types.ts'
 
 /** Evidence as captured in the ATTEMPT_RESULT_CAPTURED event (type is string). */
@@ -180,7 +181,14 @@ async function reconcileWithLlm(
   if (text.length === 0) return null
   const cleaned = text.replace(/^```(?:json)?/m, '').replace(/```$/m, '').trim()
   const parsed = JSON.parse(cleaned) as ReconcileOutput
-  if (!Array.isArray(parsed.criteria_met)) return null
+  // Schema firewall: the LLM does not own state truth. A malformed object is
+  // rejected → the caller falls back to the deterministic judgement.
+  const errors = validateReconcileOutput(parsed, task, input.evidence)
+  if (errors.length > 0) {
+    // eslint-disable-next-line no-console
+    console.log(`[dsh-instruction-queue] reconcile schema rejected:\n  ${errors.join('\n  ')}`)
+    return null
+  }
   return parsed
 }
 

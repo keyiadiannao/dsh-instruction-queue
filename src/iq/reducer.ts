@@ -275,9 +275,15 @@ function applyEvent(state: RunState, event: IQEvent): RunState {
       return { ...state, phase: 'ready', paused_note: null }
 
     case 'TASK_PROPOSED': {
+      // Residual inherits authority from its parent approved obligation:
+      // approval_status = not_required (executable carrier, NOT a new
+      // obligation, never enters the completion denominator). A scope-
+      // expanding proposal needs user approval (Invariant #4).
+      const isResidual = event.origin === 'residual'
+      const approvalStatus = isResidual ? 'not_required' as const : 'proposed' as const
       const task: Task = {
         task_id: event.task.task_id,
-        approval_status: 'proposed',
+        approval_status: approvalStatus,
         origin: event.origin,
         parent_task_id: event.parent_task_id,
         derived_from_criteria: event.derived_from_criteria,
@@ -298,7 +304,13 @@ function applyEvent(state: RunState, event: IQEvent): RunState {
         approved_task_revision: null,
         approved_acceptance_criteria: [],
       }
-      return { ...state, tasks: [...state.tasks, task], phase: 'awaiting_approval' }
+      // Residual auto-enters the executable graph (still ready); expansion
+      // lands in awaiting_approval until the user decides.
+      return {
+        ...state,
+        tasks: [...state.tasks, task],
+        phase: isResidual ? (state.phase === 'ready' ? 'ready' : 'executing') : 'awaiting_approval',
+      }
     }
 
     case 'TASK_PROPOSAL_APPROVED': {
@@ -325,6 +337,9 @@ function applyEvent(state: RunState, event: IQEvent): RunState {
 
     case 'RECOVERY_REQUIRED':
       return { ...state, phase: 'recovery_required', recovery_note: event.note }
+
+    case 'QUEUE_BLOCKED':
+      return { ...state, phase: 'blocked', recovery_note: event.note }
 
     case 'RUN_COMPLETED': {
       const tasks = state.tasks.map((t) => {
@@ -359,6 +374,19 @@ export function approvedObligations(state: RunState): Task[] {
   return state.tasks.filter((t) => t.approval_status === 'approved')
 }
 
+/**
+ * All executable tasks: approved obligations PLUS residual carriers.
+ * Residuals inherit authority from their parent approved obligation
+ * (approval_status = not_required) and are execution carriers, but they are
+ * NOT obligations — they never enter the completion denominator.
+ */
+export function executableTasks(state: RunState): Task[] {
+  return state.tasks.filter((t) =>
+    t.approval_status === 'approved'
+    || (t.origin === 'residual' && t.approval_status === 'not_required'),
+  )
+}
+
 /** True when every approved obligation is resolved (completion gate). */
 export function allApprovedResolved(state: RunState): boolean {
   const approved = approvedObligations(state)
@@ -370,17 +398,17 @@ export function allApprovedResolved(state: RunState): boolean {
   )
 }
 
-/** Find the next dispatchable approved task (topological, dependency-aware). */
+/** Find the next dispatchable task (topological, dependency-aware). */
 export function nextDispatchable(state: RunState): Task | null {
   if (state.active_task_id !== null) return null // invariant #7
-  const approved = approvedObligations(state)
+  const candidates = executableTasks(state)
     .filter((t) => t.execution_status === 'pending' || t.execution_status === 'failed')
   const resolvedIds = new Set(
-    approvedObligations(state)
+    executableTasks(state)
       .filter((t) => t.resolution_status === 'satisfied' || t.resolution_status === 'covered')
       .map((t) => t.task_id),
   )
-  for (const t of approved) {
+  for (const t of candidates) {
     const depsMet = t.hard_dependencies.every((d) => resolvedIds.has(d))
     if (depsMet) return t
   }

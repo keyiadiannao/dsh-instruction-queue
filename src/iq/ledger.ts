@@ -2,15 +2,19 @@
  * dsh-instruction-queue — append-only ledger persistence.
  *
  * The ledger is a single ndjson file per run: each line is one JSON event.
- * Writes are append-only with an fsync'd temp+rename per batch so a crash
- * never rewrites history; recovery reads the file, replays through the pure
- * reducer, and reconciles the tail (see recovery.ts). A torn tail line (crash
- * mid-append) is tolerated: the event was never durably committed.
+ * Writes are append-only and each batch is committed DURABLY: the batch is
+ * written to a temp file, fsync'd, then renamed over the live file (atomic on
+ * POSIX and on Windows via MoveFileEx replacement semantics). A crash before
+ * the rename leaves the previous durable state intact; a crash mid-append can
+ * only tear the temp file, never the live ledger. Recovery reads the file,
+ * replays through the pure reducer, and reconciles the tail (see recovery.ts).
+ * A torn tail line in the live file (defensive) is tolerated: the event was
+ * never durably committed.
  *
  * @module dsh-instruction-queue/iq/ledger
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, closeSync, fsyncSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { IQEvent } from './events.ts'
 
@@ -32,12 +36,40 @@ export function loadLedger(file: string): IQEvent[] {
   return events
 }
 
-/** Appends one event batch durably. Append-only: nothing is ever rewritten. */
+/**
+ * Appends one event batch durably.
+ *
+ * Durability protocol (matches the file's contract):
+ *  1. copy current file → `${file}.tmp`
+ *  2. append the batch to the tmp file
+ *  3. fsync the tmp file (flush to disk)
+ *  4. rename tmp over the live file (atomic swap)
+ *
+ * A crash anywhere before step 4 leaves the previous committed state intact
+ * (the live file is untouched until the rename). This is a batch commit, not
+ * a bare append — the cost is one file copy per tool call, acceptable for a
+ * low-frequency orchestration ledger.
+ */
 export function appendEvents(file: string, events: readonly IQEvent[]): void {
   if (events.length === 0) return
   mkdirSync(dirname(file), { recursive: true })
   const block = events.map((e) => JSON.stringify(e)).join('\n') + '\n'
-  appendFileSync(file, block, 'utf8')
+  const tmp = `${file}.tmp`
+
+  const prior = existsSync(file) ? readFileSync(file, 'utf8') : ''
+  // Write the full prior content + the new batch into the temp file.
+  writeFileSync(tmp, prior + block, 'utf8')
+
+  // fsync the temp file so its contents are durable before the rename.
+  const fd = openSync(tmp, 'r+')
+  try {
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+
+  // Atomic swap: readers either see the old complete ledger or the new one.
+  renameSync(tmp, file)
 }
 
 /** Assign sequential seq numbers to a batch starting after the ledger tail. */

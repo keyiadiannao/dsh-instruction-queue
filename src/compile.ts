@@ -12,6 +12,7 @@
 
 import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Config } from './index.ts'
+import { validateCompileOutput } from './iq/schema.ts'
 import type { RunState } from './iq/types.ts'
 
 /** The JSON shape the compiler must produce. */
@@ -151,7 +152,14 @@ export async function compileQueue(
     // Strip any accidental code fences.
     const cleaned = text.replace(/^```(?:json)?/m, '').replace(/```$/m, '').trim()
     const parsed = JSON.parse(cleaned) as CompileOutput
-    if (!Array.isArray(parsed.tasks) || parsed.tasks.length === 0) return null
+    // Schema firewall: the LLM does not own state truth. A malformed object
+    // is treated as a failed compile (zero loss — inputs stay buffered).
+    const errors = validateCompileOutput(parsed, state)
+    if (errors.length > 0) {
+      // eslint-disable-next-line no-console
+      console.log(`[dsh-instruction-queue] compile schema rejected:\n  ${errors.join('\n  ')}`)
+      return null
+    }
     const consumed = state.inputs.map((i) => i.queue_sequence)
     return { ...parsed, consumed_input_sequences: consumed }
   } catch (e) {

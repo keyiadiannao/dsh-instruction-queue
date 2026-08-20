@@ -26,10 +26,12 @@
  */
 
 import z from '@deepseek-ai/schemastery'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { IQEvent } from './iq/events.ts'
 import { appendEvents, assignSeqs, loadLedger } from './iq/ledger.ts'
-import { approvedObligations, nextDispatchable, reduceAll } from './iq/reducer.ts'
+import { allApprovedResolved, approvedObligations, nextDispatchable, reduceAll } from './iq/reducer.ts'
+import { auditCoverage } from './iq/invariants.ts'
 import type { RunState, Task } from './iq/types.ts'
 import type { ReconcileEvidence } from './reconcile.ts'
 
@@ -52,12 +54,21 @@ export interface Config {
 
 /** Schemastery schema; cordis validates and provides it as apply(ctx, config). */
 export const Config: z<Config> = z.object({
-  dataDir: z.string().default('C:/Users/26433/.dsh/storages/instruction-queue'),
+  // Empty default → resolve portably at apply time (~/.dsh/storages/...).
+  dataDir: z.string().default(''),
   llmProvider: z.string().default(''),
   llmModel: z.string().default(''),
   allowPartialApproval: z.boolean().default(true),
   maxCompiledTasks: z.number().min(1).max(50).default(12),
 })
+
+/** Resolve the ledger root: explicit config, else the portable default. */
+export function resolveDataDir(configDataDir: string): string {
+  if (configDataDir.length > 0) return configDataDir
+  // Never hardcode a user-specific path — Node's homedir() is the portable
+  // source (Windows USERPROFILE / POSIX $HOME under the hood).
+  return join(homedir(), '.dsh', 'storages', 'instruction-queue')
+}
 
 /** A registered tool's execute context (subset we rely on). */
 interface ExecCtx {
@@ -71,11 +82,13 @@ interface ExecCtx {
 }
 
 export function apply(ctx: any, config: Config): void {
+  // Portable ledger root (explicit config wins, else ~/.dsh/storages/...).
+  const dataDir = resolveDataDir(config.dataDir)
   // Per-session run state cache: { sessionId → { events, state } }.
   // This is a cache ONLY; the ledger file is authoritative (Invariant #9).
   const runs = new Map<string, { events: IQEvent[]; state: RunState }>()
 
-  const ledgerOf = (sessionId: string) => join(config.dataDir, `${sessionId}.ndjson`)
+  const ledgerOf = (sessionId: string) => join(dataDir, `${sessionId}.ndjson`)
   const sessionOf = (exec: ExecCtx): string => {
     const id = exec.agent?.session?.id
     return id === undefined || id === null ? '' : String(id)
@@ -374,7 +387,12 @@ export function apply(ctx: any, config: Config): void {
           },
         ]
         const next = commitEvents(sessionId, afterRequest.events, evts)
+        const maxTasks = Math.max(1, config.maxCompiledTasks)
+        const overLimit = compiled.tasks.length > maxTasks
         const message = `Compiled ${compiled.tasks.length} proposed obligation(s) — phase ${next.state.phase}. `
+          + (overLimit
+            ? `⚠ ${compiled.tasks.length} tasks exceeds maxCompiledTasks (${maxTasks}) — consider splitting or pruning. `
+            : '')
           + (compiled.dependency_cycles.length > 0
             ? '⚠ unresolved dependency cycle(s): approval is blocked until resolved. '
             : 'Review and approve with iq_approve (or adjust inputs and recompile).')
@@ -383,7 +401,10 @@ export function apply(ctx: any, config: Config): void {
           proposed_tasks: compiled.tasks.length,
           conflicts: compiled.conflicts.map((c) => `${c.from_input_id} ${c.kind === 'supersedes' ? 'superseded by' : 'contradicts'} ${c.to_input_id}`),
           cycles: compiled.dependency_cycles.map((c) => c.join(' → ')),
-          ambiguities: compiled.ambiguities.map((a) => `${a.input_ids.join(', ')}: ${a.note}`),
+          ambiguities: [
+            ...compiled.ambiguities.map((a) => `${a.input_ids.join(', ')}: ${a.note}`),
+            ...(overLimit ? [`task count ${compiled.tasks.length} > maxCompiledTasks ${maxTasks}`] : []),
+          ],
           message,
         }
       },
@@ -461,10 +482,49 @@ export function apply(ctx: any, config: Config): void {
         if (proposed.length === 0) {
           return { ok: false, approved: 0, rejected: 0, phase: run.state.phase, message: 'No proposed tasks to approve.' }
         }
-        const supersessions = Array.isArray(args.supersessions) ? args.supersessions : []
+        // GATE 1 — unresolved hard-dependency cycles block approval
+        // (design: "unresolved hard dependency cycle 不进入 READY").
+        if (run.state.dependency_cycles.length > 0) {
+          return {
+            ok: false, approved: 0, rejected: 0, phase: run.state.phase,
+            message: `Approval blocked: unresolved dependency cycle(s) ${run.state.dependency_cycles.map((c) => c.join(' → ')).join('; ')}. Recompile after fixing inputs, or reject the cyclic tasks.`,
+          }
+        }
+        // GATE 2 — every compiler-reported supersession/contradiction must be
+        // acknowledged (or its tasks rejected) before approval. A supersede
+        // conflict means input `to` replaces input `from`; the user must
+        // confirm by passing { from, to }, or reject tasks carrying `from`.
+        const ackedPairs = new Set(
+          (Array.isArray(args.supersessions) ? args.supersessions : [])
+            .filter((s) => typeof s?.from === 'string' && typeof s?.to === 'string')
+            .map((s) => `${s.from}->${s.to}`),
+        )
         const rejectIds = new Set(Array.isArray(args.reject_task_ids) ? args.reject_task_ids : [])
+        const unacked: string[] = []
+        for (const c of run.state.conflicts) {
+          const pair = `${c.from_input_id}->${c.to_input_id}`
+          const covered = ackedPairs.has(pair)
+          const rejected = proposed.some((t) => rejectIds.has(t.task_id) && t.source_input_ids.includes(c.from_input_id))
+          if (!covered && !rejected) {
+            unacked.push(`${c.from_input_id} ${c.kind === 'supersedes' ? 'superseded by' : 'contradicts'} ${c.to_input_id}`)
+          }
+        }
+        if (unacked.length > 0) {
+          return {
+            ok: false, approved: 0, rejected: 0, phase: run.state.phase,
+            message: `Approval blocked: unresolved compiler conflict(s): ${unacked.join('; ')}. Acknowledge each with supersessions: [{from, to}] or reject the affected tasks.`,
+          }
+        }
+        // GATE 3 — partial approval only when the deployment allows it.
+        const wantsPartial = args.approve_all === false && Array.isArray(args.task_ids) && args.task_ids.length > 0
+        if (wantsPartial && !config.allowPartialApproval) {
+          return {
+            ok: false, approved: 0, rejected: 0, phase: run.state.phase,
+            message: 'Partial approval is disabled by config (allowPartialApproval=false) — approve the whole queue with approve_all=true.',
+          }
+        }
         let approveIds: Set<string>
-        if (args.approve_all === false && Array.isArray(args.task_ids) && args.task_ids.length > 0) {
+        if (wantsPartial) {
           approveIds = new Set(args.task_ids)
         } else {
           approveIds = new Set(proposed.map((t) => t.task_id))
@@ -475,11 +535,9 @@ export function apply(ctx: any, config: Config): void {
         if (approveList.length === 0) {
           return { ok: false, approved: 0, rejected: rejectList.length, phase: run.state.phase, message: 'Nothing approved — provide task_ids or approve_all=true.' }
         }
-        // Acknowledged supersessions: the compiler's supersede conflicts that
-        // the user confirms. We record them as facts in the approval event.
-        const acked = supersessions.filter((s) =>
-          typeof s?.from === 'string' && typeof s?.to === 'string',
-        ).map((s) => ({ from_input_id: s.from, to_input_id: s.to }))
+        const acked = (Array.isArray(args.supersessions) ? args.supersessions : [])
+          .filter((s) => typeof s?.from === 'string' && typeof s?.to === 'string')
+          .map((s) => ({ from_input_id: s.from, to_input_id: s.to }))
         const rev = 1 // V1: first approval revision; semantic edits bump later via proposal
         const evt: IQEvent = {
           kind: 'QUEUE_APPROVED',
@@ -569,9 +627,13 @@ export function apply(ctx: any, config: Config): void {
         }
         const attemptId = `A${task.attempts.length + 1}`
         const ts = nowIso()
+        // Dispatch ONLY. ATTEMPT_STARTED is written by iq_reconcile when the
+        // segment has actually executed — this preserves the real crash
+        // window "dispatched-but-not-started" that recovery.ts models
+        // (a crash after dispatch but before any execution is uncertain,
+        // never silently re-run).
         const evts: IQEvent[] = [
           { kind: 'TASK_DISPATCHED', seq: -1, run_id: sessionId, ts, task_id: task.task_id, attempt_id: attemptId },
-          { kind: 'ATTEMPT_STARTED', seq: -1, run_id: sessionId, ts, task_id: task.task_id, attempt_id: attemptId },
         ]
         const next = commitEvents(sessionId, run.events, evts)
         const envelope = {
@@ -679,7 +741,38 @@ export function apply(ctx: any, config: Config): void {
         }
 
         const ts = nowIso()
+        // P0-5: ATTEMPT_STARTED is a FACT of actual execution. iq_execute_next
+        // only dispatched; reaching iq_reconcile proves the segment ran, so
+        // this is the moment the attempt truly started (and now finished).
+        // In the crash window (dispatch, crash, no reconcile) the attempt
+        // stays 'dispatched' and recovery.ts treats it as uncertain.
         const evid = Array.isArray(args.evidence) ? args.evidence : []
+        const preEvents: IQEvent[] = []
+        if (attempt.status === 'dispatched') {
+          preEvents.push({
+            kind: 'ATTEMPT_STARTED', seq: -1, run_id: sessionId, ts,
+            task_id: task.task_id, attempt_id: attempt.attempt_id,
+          })
+        }
+        // SIDE_EFFECT_OBSERVED: a write/external/irreversible side effect that
+        // reconcile can prove from captured evidence (file changes, external
+        // calls, workspace mutations). Agent conclusions alone never count.
+        const observedEffect = evid.some((e) => e.type === 'file_change' || e.type === 'workspace_state')
+          ? 'write'
+          : evid.some((e) => e.type === 'external')
+            ? 'external'
+            : null
+        if (observedEffect !== null) {
+          preEvents.push({
+            kind: 'SIDE_EFFECT_OBSERVED', seq: -1, run_id: sessionId, ts,
+            task_id: task.task_id, attempt_id: attempt.attempt_id,
+            effect_class: observedEffect,
+          })
+        }
+        let baseRun = run
+        if (preEvents.length > 0) {
+          baseRun = commitEvents(sessionId, run.events, preEvents)
+        }
         const evtCap: IQEvent = {
           kind: 'ATTEMPT_RESULT_CAPTURED',
           seq: -1,
@@ -700,7 +793,7 @@ export function apply(ctx: any, config: Config): void {
             ...(e.note !== undefined ? { note: e.note } : {}),
           })),
         }
-        const captured = commitEvents(sessionId, run.events, [evtCap])
+        const captured = commitEvents(sessionId, baseRun.events, [evtCap])
 
         // The LLM semantic work (criterion judgement + residual/expansion
         // extraction) lives in the lazily-imported module.
@@ -758,23 +851,45 @@ export function apply(ctx: any, config: Config): void {
         const unresolved = approved.filter((t) => !['satisfied', 'covered', 'skipped'].includes(t.resolution_status))
         const remaining = unresolved.length
         let message = `Reconciled ${task.task_id}: resolution=${rec.resolution_status}.`
+        let auditFailures: { task_id: string; criterion_id: string; reason: string }[] = []
         if (remaining === 0 && approved.length > 0) {
-          const comp: IQEvent = {
-            kind: 'RUN_COMPLETED',
-            seq: -1,
-            run_id: sessionId,
-            ts: nowIso(),
-            summary: approved.map((t) => ({ task_id: t.task_id, resolution_status: t.resolution_status })),
+          // Final coverage audit (design: incremental reconcile and the final
+          // coverage audit are SEPARATE). Every approved AC must have
+          // non-agent evidence; otherwise the run is BLOCKED, not completed.
+          auditFailures = auditCoverage(next.state).filter((a) => !a.ok)
+          if (auditFailures.length === 0) {
+            const comp: IQEvent = {
+              kind: 'RUN_COMPLETED',
+              seq: -1,
+              run_id: sessionId,
+              ts: nowIso(),
+              summary: approved.map((t) => ({ task_id: t.task_id, resolution_status: t.resolution_status })),
+            }
+            const final = commitEvents(sessionId, next.events, [comp])
+            message = `All ${approved.length} approved obligation(s) resolved AND final coverage audit passed — queue COMPLETED (phase ${final.state.phase}).`
+          } else {
+            const blocked: IQEvent = {
+              kind: 'QUEUE_BLOCKED',
+              seq: -1,
+              run_id: sessionId,
+              ts: nowIso(),
+              note: `final coverage audit failed: ${auditFailures.map((f) => `${f.task_id}/${f.criterion_id}: ${f.reason}`).join('; ')}`,
+            }
+            const blockedState = commitEvents(sessionId, next.events, [blocked])
+            message = `Coverage audit FAILED — queue BLOCKED (phase ${blockedState.state.phase}). `
+              + `${auditFailures.map((f) => `${f.task_id}/${f.criterion_id}: ${f.reason}`).join('; ')}. `
+              + 'Resolve by adding evidence, or skip the affected criteria, then reconcile again.'
           }
-          const final = commitEvents(sessionId, next.events, [comp])
-          message = `All ${approved.length} approved obligation(s) resolved — queue COMPLETED (phase ${final.state.phase}).`
         } else {
           message += ` ${remaining} obligation(s) remain (phase ${next.state.phase}).`
         }
         return {
           ok: true,
           resolution: rec.resolution_status,
-          audit_issues: rec.audit_issues,
+          audit_issues: [
+            ...rec.audit_issues,
+            ...auditFailures.map((f) => `${f.task_id}/${f.criterion_id}: ${f.reason}`),
+          ],
           proposed: rec.proposals.map((p) => `${p.task.task_id} (${p.origin})`),
           remaining,
           message,
@@ -787,7 +902,5 @@ export function apply(ctx: any, config: Config): void {
 
 /** True when every approved obligation is resolved (completion gate). */
 function allResolved(state: RunState): boolean {
-  const approved = approvedObligations(state)
-  if (approved.length === 0) return false
-  return approved.every((t) => ['satisfied', 'covered', 'skipped'].includes(t.resolution_status))
+  return allApprovedResolved(state)
 }

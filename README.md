@@ -13,6 +13,9 @@ This is an **event-sourced obligation orchestrator**, not "a queue plugin that
 calls an LLM": the append-only ledger is the single source of truth, the pure
 reducer projects it to run state (System Invariant #9), and the LLM only
 performs semantic judgment inside compile/reconcile — it never owns state truth.
+Between the LLM and the ledger sits a **schema firewall** (`src/iq/schema.ts`):
+any malformed / hallucinated LLM output is rejected as a failed call, never
+silently written as a fact.
 
 ## The three V1 differentiators
 
@@ -32,8 +35,14 @@ performs semantic judgment inside compile/reconcile — it never owns state trut
 
 ## Status
 
-**V1 — competitive-validation MVP** (host-only, tool-driven loop). No client
-UI yet; the queue is driven through the six `iq_*` tools.
+**V1 — protocol-correctness MVP** (host-only, tool-driven loop). The full
+orchestration protocol is implemented and invariant-checked: compile → approve
+(gates: unresolved dependency cycles and unacknowledged conflicts block
+approval) → segment execution (dispatch/start separation preserves the real
+crash window) → reconcile (evidence-driven criterion judgement, residual
+auto-entry vs expansion approval, **final coverage audit before completion** —
+a failed audit BLOCKS the run instead of completing it). No client UI yet; the
+queue is driven through the seven `iq_*` tools.
 
 ## Install
 
@@ -47,17 +56,18 @@ Add to your profile's `package.json` bundles + dependencies
 "dsh-instruction-queue"
 ```
 
-Restart the harness. The plugin registers six tools: `iq_enable`, `iq_collect`,
-`iq_compile`, `iq_approve`, `iq_execute_next`, `iq_reconcile`, `iq_status`.
+Restart the harness. The plugin registers seven tools: `iq_enable`,
+`iq_collect`, `iq_compile`, `iq_approve`, `iq_execute_next`, `iq_reconcile`,
+`iq_status`.
 
 ## Configuration
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `dataDir` | `~/.dsh/storages/instruction-queue` | Directory holding one `<session>.ndjson` ledger per run |
+| `dataDir` | `~/.dsh/storages/instruction-queue` (resolved via `os.homedir()`) | Directory holding one `<session>.ndjson` ledger per run |
 | `llmProvider` / `llmModel` | `''` (session default) | Provider/model for compile + reconcile semantic calls |
-| `allowPartialApproval` | `true` | Allow approving a subset of the compiled queue |
-| `maxCompiledTasks` | `12` | Compiler warning threshold |
+| `allowPartialApproval` | `true` | When `false`, `iq_approve` requires whole-queue approval |
+| `maxCompiledTasks` | `12` | Compiler warns when the proposal exceeds this many tasks |
 
 ## Usage (tool loop)
 
@@ -65,28 +75,32 @@ Restart the harness. The plugin registers six tools: `iq_enable`, `iq_collect`,
 2. **`iq_collect`** — buffer instruction segments (any number; each recorded
    verbatim with its queue position).
 3. **`iq_compile`** — LLM compiles the buffer into a PROPOSED queue with
-   acceptance criteria, conflicts, cycles, ambiguities.
+   acceptance criteria, conflicts, cycles, ambiguities (schema-validated).
 4. **`iq_approve`** — user approves (whole or partial) + acknowledges
-   supersessions. Approval locks semantics + criteria at this revision.
+   supersessions. **Blocked** while dependency cycles or unacknowledged
+   conflicts remain. Approval locks semantics + criteria at this revision.
 5. **`iq_execute_next`** — dispatch the next obligation; returns the execution
-   envelope (task + criteria + constraints). Execute ONLY this segment.
+   envelope (task + criteria + constraints). Only `TASK_DISPATCHED` is written
+   here — the attempt is not yet "started".
 6. **`iq_reconcile`** — report the result (summary + evidence + per-criterion
-   judgement). The plugin judges criteria, auto-enters residual work, proposes
-   expansions, and completes the run when every approved obligation resolves.
+   judgement). The plugin writes `ATTEMPT_STARTED` + `SIDE_EFFECT_OBSERVED`
+   (when provable), judges criteria against evidence, auto-enters residual work,
+   proposes expansions, and — when every approved obligation resolves — runs the
+   **final coverage audit** before `RUN_COMPLETED` (failure → `QUEUE_BLOCKED`).
 
 `iq_status` is read-only — check phase, buffered inputs, obligations, next task.
 
 ## Design
 
-The design is frozen in
-[`docs/dev/DSH_PROMPT_SEQUENCE_DESIGN_2026-08-20.md`](../../docs/dev/DSH_PROMPT_SEQUENCE_DESIGN_2026-08-20.md)
-(6 rounds of review; state machine, dual status enums, reconcile boundary,
-immutable revision boundary, at-most-once retry, coverage judgment, crash
-recovery matrix, 9 System Invariants).
+The design is frozen in [`docs/DESIGN.md`](docs/DESIGN.md) (6 rounds of review;
+state machine, dual status enums, reconcile boundary, immutable revision
+boundary, at-most-once retry, coverage judgment, crash recovery matrix, 9
+System Invariants).
 
-Architecture: `src/iq/{types,events,reducer,recovery,invariants,ledger}.ts` —
+Architecture: `src/iq/{types,events,reducer,recovery,invariants,ledger,schema}.ts` —
 pure protocol layer, no LLM/IO; `src/compile.ts` + `src/reconcile.ts` — lazy
-LLM semantic judgment; `src/index.ts` — the tool loop.
+LLM semantic judgment behind the schema firewall; `src/index.ts` — the tool
+loop.
 
 ## License
 
