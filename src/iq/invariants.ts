@@ -152,7 +152,15 @@ export function auditCoverage(state: RunState): {
         continue
       }
       const evs = refs.map((r) => t.evidence.find((e) => e.id === r)).filter((e): e is NonNullable<typeof e> => e !== undefined)
-      const onlyAgent = evs.length > 0 && evs.every((e) => e.authority === 'agent')
+      // Every referenced evidence id must actually RESOLVE. A nonempty ref
+      // list whose ids are all dangling is NOT "evidence present" — it means
+      // the criterion claims coverage it cannot prove (fix: it was a false
+      // pass before, because onlyAgent was computed over an empty resolved set).
+      if (evs.length !== refs.length) {
+        out.push({ task_id: t.task_id, criterion_id: ac.criterion_id, ok: false, reason: 'evidence refs unresolved (dangling)' })
+        continue
+      }
+      const onlyAgent = evs.every((e) => e.authority === 'agent')
       if (onlyAgent) {
         out.push({ task_id: t.task_id, criterion_id: ac.criterion_id, ok: false, reason: 'only agent-authority evidence' })
         continue

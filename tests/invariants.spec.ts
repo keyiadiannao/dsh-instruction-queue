@@ -131,4 +131,23 @@ describe('auditCoverage — Invariant #5/#6 at completion', () => {
     const toolEv = auditCoverage(s)[0]!
     expect(toolEv.ok).toBe(true)
   })
+
+  it('dangling evidence refs fail the audit (not a false pass)', () => {
+    const s = state()
+    s.tasks = [{
+      task_id: 'T1', approval_status: 'approved', origin: 'approved', parent_task_id: null,
+      derived_from_criteria: [], source_input_ids: [], task: 'x', intent_type: 'modify',
+      targets: [], execution_status: 'finished', resolution_status: 'satisfied', attempts: [],
+      acceptance_criteria: [{ criterion_id: 'AC1', text: 'c' }], side_effect_class: 'write',
+      hard_dependencies: [], soft_affinities: [],
+      // criteria_met references E9 which does NOT exist in t.evidence (empty).
+      evidence: [],
+      coverage: { satisfied_by: ['T1'], criteria_met: [{ criterion_id: 'AC1', evidence_refs: ['E9'] }] },
+      revision: 1, approved_task_revision: 1,
+      approved_acceptance_criteria: [{ criterion_id: 'AC1', text: 'c' }],
+    }]
+    const res = auditCoverage(s)[0]!
+    expect(res.ok).toBe(false)
+    expect(res.reason).toMatch(/dangling|unresolved/)
+  })
 })

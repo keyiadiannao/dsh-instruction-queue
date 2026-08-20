@@ -29,6 +29,7 @@ import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { createHash } from 'node:crypto'
 import type { IQEvent } from './iq/events.ts'
 import { appendEvents, assignSeqs, loadLedger } from './iq/ledger.ts'
 import { allApprovedResolved, approvedObligations, executableTasks, nextDispatchable, reduceAll } from './iq/reducer.ts'
@@ -135,7 +136,11 @@ export function apply(ctx: any, config: Config): void {
   // This is a cache ONLY; the ledger file is authoritative (Invariant #9).
   const runs = new Map<string, { events: IQEvent[]; state: RunState }>()
 
-  const ledgerOf = (sessionId: string) => join(dataDir, `${sessionId}.ndjson`)
+  // SECURITY: never derive the ledger filename from a raw session id (a
+  // session id ending in ../ could escape dataDir). Use a fixed-length sha256
+  // hash of the id as the filename; the raw id is stored inside the ledger
+  // (run_id/session_id) and verified on replay.
+  const ledgerOf = (sessionId: string) => join(dataDir, `${sha256Hex(sessionId)}.ndjson`)
   const sessionOf = (exec: ExecCtx): string => {
     const id = exec.agent?.session?.id
     return id === undefined || id === null ? '' : String(id)
@@ -1328,41 +1333,63 @@ export function apply(ctx: any, config: Config): void {
         }
 
         // 2) LIVE INTAKE: buffer human text inputs while the plan is active.
-        //    A claimed batch may mix our envelope + human deltas + steering;
-        //    only swallow when the batch is PURE human intake (spend no model
-        //    call), otherwise restore the non-human records.
+        //    The running attempt is IMMUTABLE (design invariant): a human
+        //    interjection must be buffered as a Pending Delta, never fed into
+        //    the model's current step. A claimed batch may mix our envelope +
+        //    human deltas + steering; we must NOT call next() after recording a
+        //    human delta (next() feeds the whole batch to the model, leaking
+        //    the unapproved delta into the running attempt).
         const run = runs.get(id)
         if (run !== undefined && run.state.enabled
           && run.state.phase !== 'completed' && run.state.phase !== 'aborted') {
           const deltas = batch.filter((m) => isCaptureCandidate(m))
-          if (deltas.length > 0) {
-            const texts = deltas.map(textOfMessage).filter((t) => t.length > 0)
-              .filter((t) => !isControlUtterance(t))
-            if (texts.length > 0) {
-              const startSeq = run.state.inputs.length
-              const ts = nowIso()
-              const evts: IQEvent[] = texts.map((content, i) => ({
-                kind: 'INPUT_BUFFERED' as const,
-                seq: -1,
-                run_id: id,
-                ts,
-                input_id: `IN${startSeq + i + 1}`,
-                content,
-                queue_sequence: startSeq + i + 1,
-                last_visible_event_id: null,
-                session_id: id,
-              }))
-              commitEvents(id, run.events, evts)
-              // eslint-disable-next-line no-console
-              console.log(`[dsh-instruction-queue] driver: live intake buffered ${texts.length} (phase=${run.state.phase})`)
-            }
-            // Only spend no model call when the whole claimed batch was human.
-            const humanIds = new Set(deltas.map((m) => m.id))
-            const allHuman = batch.every((m) => m.id === undefined || humanIds.has(m.id))
-            if (allHuman && texts.length > 0) {
+          const humanTexts = deltas.map(textOfMessage).filter((t) => t.length > 0)
+            .filter((t) => !isControlUtterance(t))
+          if (deltas.length > 0 && humanTexts.length > 0) {
+            // Buffer the human interjection into the ledger as a Pending Delta.
+            const startSeq = run.state.inputs.length
+            const ts = nowIso()
+            const evts: IQEvent[] = humanTexts.map((content, i) => ({
+              kind: 'INPUT_BUFFERED' as const,
+              seq: -1,
+              run_id: id,
+              ts,
+              input_id: `IN${startSeq + i + 1}`,
+              content,
+              queue_sequence: startSeq + i + 1,
+              last_visible_event_id: null,
+              session_id: id,
+            }))
+            commitEvents(id, run.events, evts)
+            // eslint-disable-next-line no-console
+            console.log(`[dsh-instruction-queue] driver: live intake buffered ${humanTexts.length} (phase=${run.state.phase})`)
+            // Competing input present → pause auto-drive until the delta is
+            // interpreted at the reconciliation barrier.
+            state.competingQueued = true
+
+            // Determine whether the remaining (non-human) records are entirely
+            // our own approved envelope(s) or foreign (steering/other).
+            const nonHuman = batch.filter((m) => !isCaptureCandidate(m))
+            const onlyOurs = nonHuman.every((m) => m.source?.kind === 'plugin' && m.source.plugin === 'dsh-instruction-queue')
+            if (onlyOurs && nonHuman.length > 0) {
+              // Mixed batch: our approved envelope + human delta. Admit ONLY
+              // the approved envelope so the already-approved segment runs;
+              // do not leak the unapproved delta into the model step.
               requestDrive(state)
-              return { kind: 'enter', messages: [] }
+              return { kind: 'enter', messages: nonHuman }
             }
+            // Foreign non-human records in a mixed batch: reject the whole
+            // proposal and restore ONLY the foreign records (the human delta
+            // is already buffered in the ledger; the approved envelope is
+            // dropped to let the competing input take the next turn).
+            if (nonHuman.length > 0) {
+              restoreForeign(live, batch, deltas)
+              requestDrive(state)
+              return { kind: 'reject' }
+            }
+            // Pure human batch: spend no model call.
+            requestDrive(state)
+            return { kind: 'enter', messages: [] }
           }
         }
         return next()
@@ -1399,6 +1426,12 @@ function textOfMessage(m: { content?: unknown }): string {
     .join('\n')
 }
 
+/** SHA-256 hex of a string — used to map a session id to a fixed-length,
+ * filesystem-safe ledger filename (prevents path traversal via session id). */
+export function sha256Hex(input: string): string {
+  return createHash('sha256').update(input).digest('hex')
+}
+
 /** Control utterances route to the queue tools instead of being buffered. */
 function isControlUtterance(text: string): boolean {
   const t = text.trim()
@@ -1425,6 +1458,32 @@ function restoreOtherClaimed(
     const inNextStep = (agent.inbox.nextStep ?? []).some((c) => c.id === message.id)
     const inNextTurn = (agent.inbox.nextTurn ?? []).some((c) => c.id === message.id)
     if (inNextStep || inNextTurn) continue
+    agent.inbox.prepend('next-step', message)
+  }
+}
+
+/**
+ * Restore ONLY foreign (non-human, non-our-envelope) records from a claimed
+ * batch back to next-step. Used when a mixed batch (foreign steering + human
+ * delta + our envelope) must be rejected: the human delta is already buffered
+ * in the ledger (must NOT re-enter the inbox), our envelope is dropped to let
+ * the competing input win the turn, and only foreign records are preserved.
+ * `human` is the set of human UserMessage objects already buffered.
+ */
+function restoreForeign(
+  agent: AgentLike | undefined,
+  messages: readonly { id?: string; source?: { kind?: string; plugin?: string } }[],
+  human: readonly { id?: string }[],
+): void {
+  if (agent === undefined || agent.inbox?.prepend === undefined) return
+  const humanIds = new Set(human.map((h) => h.id).filter((x): x is string => x !== undefined))
+  const foreign = messages.filter((m) =>
+    !(m.source?.kind === 'user')
+    && !(m.source?.kind === 'plugin' && m.source.plugin === 'dsh-instruction-queue')
+    && !(m.id !== undefined && humanIds.has(m.id)))
+  for (const message of foreign.toReversed()) {
+    if ((agent.inbox.nextStep ?? []).some((c) => c.id === message.id)) continue
+    if ((agent.inbox.nextTurn ?? []).some((c) => c.id === message.id)) continue
     agent.inbox.prepend('next-step', message)
   }
 }
