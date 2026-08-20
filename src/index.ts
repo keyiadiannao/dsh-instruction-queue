@@ -38,7 +38,7 @@ import type { ReconcileEvidence } from './reconcile.ts'
 
 export const name = 'dsh-instruction-queue'
 
-export const inject = ['tools', 'llm', 'webServer']
+export const inject = ['tools', 'llm', 'webServer', 'agents']
 
 /** Plugin configuration. */
 export interface Config {
@@ -85,14 +85,47 @@ export function resolveDataDir(configDataDir: string): string {
 /** A registered tool's execute context (subset we rely on). */
 interface ExecCtx {
   signal?: AbortSignal
-  agent?: {
-    session?: {
-      id?: unknown
-      requestHeader?: () => { config?: { provider?: string; model?: string } }
-    }
-    /** Push-driven dispatch: inject the next execution envelope and wake the loop. */
-    followup?: (input: { content: unknown; source?: unknown }) => void
+  agent?: AgentLike
+}
+
+/** The live agent surface the driver + tools rely on (loose; typechecked locally). */
+interface AgentLike {
+  id: string
+  status: 'idle' | 'running'
+  session?: {
+    id?: unknown
+    requestHeader?: () => { config?: { provider?: string; model?: string } }
   }
+  inbox?: {
+    nextTurn?: readonly { id?: string; content?: unknown; source?: { kind?: string; plugin?: string } }[]
+    nextStep?: readonly { id?: string; content?: unknown; source?: { kind?: string; plugin?: string } }[]
+    hasPending?: boolean
+    append?(target: 'next-turn' | 'next-step', message: unknown): void
+    prepend?(target: 'next-turn' | 'next-step', message: unknown): void
+  }
+  /** Push-driven dispatch: inject the next execution envelope and wake the loop. */
+  followup?: (input: { content: unknown; source?: unknown }) => void
+  cancel?(cause: unknown, options?: { keepInbox?: boolean }): void
+  whenIdle?(): Promise<void>
+}
+
+/** One queued/claimed execution envelope reserved until quiescence. */
+interface DriverAttempt {
+  messageId: string
+  taskId: string
+  attemptId: string
+  phase: 'queued' | 'claimed' | 'admitted'
+  stale: boolean
+}
+
+/** Serialized process-local scheduling state for one agent lifecycle. */
+interface DriverState {
+  agent: AgentLike
+  attempt: DriverAttempt | undefined
+  competingQueued: boolean
+  requested: boolean
+  run: Promise<void> | undefined
+  stopping: boolean
 }
 
 export function apply(ctx: any, config: Config): void {
@@ -135,6 +168,150 @@ export function apply(ctx: any, config: Config): void {
   }
 
   const nowIso = () => new Date().toISOString()
+
+  // ── idle-gated IQ driver (goal-round-driver pattern) ──────────────────────
+  // The plan drives segment execution from an EXTERNAL driver that only acts
+  // when the whole agent is idle, so a human interjection queued in nextTurn
+  // is never hidden behind our push envelope (Inbox.claim takes only the FIFO
+  // head of nextTurn at a fresh turn). Reconcile marks the run as needing a
+  // drive; agent/status==='idle' runs it; agent/inbox/inserted raises a
+  // competing flag that pauses us; agent/pre-step validates stale reservations
+  // and buffers human deltas (live intake).
+  const driverStates = new Map<string, DriverState>()
+
+  /** Get (or create) the serialized driver state for a session id. */
+  function stateForSession(sessionId: string): DriverState {
+    const existing = driverStates.get(sessionId)
+    if (existing !== undefined) return existing
+    const state: DriverState = {
+      agent: { id: sessionId, status: 'idle' } as AgentLike,
+      attempt: undefined,
+      competingQueued: false,
+      requested: false,
+      run: undefined,
+      stopping: false,
+    }
+    driverStates.set(sessionId, state)
+    return state
+  }
+
+  /** Whether this exact lifecycle is quiescent with no competing prompt. */
+  function readyToDrive(state: DriverState): boolean {
+    return !state.stopping
+      && state.agent.status === 'idle'
+      && !state.competingQueued
+  }
+
+  /**
+   * Dispatch the next runnable approved segment (write TASK_DISPATCHED) and
+   * reserve ONE execution envelope, then followup() it. Called only from the
+   * idle driver, so a queued human prompt gets its own turn first.
+   */
+  function drive(state: DriverState): Promise<void> {
+    // ONLY drive from true quiescence — if the agent is still running (e.g. a
+    // requestDrive arrived from inside the reconcile tool), do nothing; the
+    // agent/status==='idle' transition will re-trigger the driver later.
+    if (!readyToDrive(state)) return Promise.resolve()
+    const sessionId = state.agent.id
+    const run = runs.get(sessionId)
+    if (run === undefined || !run.state.enabled) return Promise.resolve()
+    if (run.state.active_task_id !== null) return Promise.resolve() // one owner
+    // Phase gates: only drive when the queue is ready/executing/reconciling.
+    const phase = run.state.phase
+    if (phase !== 'ready' && phase !== 'executing' && phase !== 'reconciling') return Promise.resolve()
+    const next = nextDispatchable(run.state)
+    if (next === null) return Promise.resolve()
+    const attemptId = `A${next.attempts.length + 1}`
+    const dispatchEvt: IQEvent = {
+      kind: 'TASK_DISPATCHED', seq: -1, run_id: sessionId, ts: nowIso(),
+      task_id: next.task_id, attempt_id: attemptId,
+    }
+    const afterDispatch = commitEvents(sessionId, run.events, [dispatchEvt])
+    const t = afterDispatch.state.tasks.find((x) => x.task_id === next.task_id)
+    if (t === undefined) return Promise.resolve()
+    const message = buildEnvelopeMessage(t, attemptId)
+    const reservation: DriverAttempt = {
+      messageId: message.id,
+      taskId: t.task_id,
+      attemptId,
+      phase: 'queued',
+      stale: false,
+    }
+    state.attempt = reservation
+    try {
+      // The live agent may differ from the state stub; resolve it via ctx.
+      const live = resolveLiveAgent(sessionId)
+      if (live !== undefined && typeof live.followup === 'function') {
+        live.followup(message)
+        // eslint-disable-next-line no-console
+        console.log(`[dsh-instruction-queue] driver: followup envelope ${t.task_id} (${attemptId})`)
+      } else {
+        // eslint-disable-next-line no-console
+        console.log(`[dsh-instruction-queue] driver: no live agent for ${sessionId}; envelope reserved, not sent`)
+      }
+    } catch (e) {
+      state.attempt = undefined
+      // eslint-disable-next-line no-console
+      console.log(`[dsh-instruction-queue] driver: followup failed for ${sessionId}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+    return Promise.resolve()
+  }
+
+  /** Coalesce triggers onto one agent-local serialized driver. */
+  function requestDrive(state: DriverState): void {
+    if (state.stopping) return
+    state.requested = true
+    if (state.run !== undefined) return
+    let run: Promise<void>
+    try {
+      run = (async () => {
+        while (state.requested && !state.stopping) {
+          state.requested = false
+          try {
+            await drive(state)
+          } catch (e) {
+            // eslint-disable-next-line no-console
+            console.log(`[dsh-instruction-queue] driver failed for ${state.agent.id}: ${e instanceof Error ? e.message : String(e)}`)
+          }
+        }
+      })()
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.log(`[dsh-instruction-queue] could not start driver for ${state.agent.id}: ${e instanceof Error ? e.message : String(e)}`)
+      return
+    }
+    state.run = run
+    const retire = (): void => {
+      state.run = undefined
+      if (state.requested && !state.stopping) requestDrive(state)
+    }
+    void run.then(retire, () => { retire() })
+  }
+
+  /**
+   * Reconcile calls this after writing its events: mark the run as needing a
+   * drive. The driver fires when the agent converges to idle.
+   */
+  function requestDriveForAgent(agent: AgentLike | undefined): void {
+    const sessionId = agent?.session?.id
+    if (sessionId === undefined || sessionId === null) return
+    const id = String(sessionId)
+    const state = stateForSession(id)
+    // Refresh the live agent so status checks are real.
+    const live = resolveLiveAgent(id)
+    if (live !== undefined) state.agent = live
+    requestDrive(state)
+  }
+
+  /** Resolve the live agent instance for a session id via ctx.agents. */
+  function resolveLiveAgent(sessionId: string): AgentLike | undefined {
+    try {
+      const agents = (ctx as { agents?: { get?: (id: string) => AgentLike | undefined } }).agents
+      return agents?.get?.(sessionId)
+    } catch {
+      return undefined
+    }
+  }
 
   // ── HTTP status surface (for the client plan panel) ──────────────────────
   // GET /api/dsh-instruction-queue/status?sessionId=... → serializable
@@ -983,30 +1160,13 @@ export function apply(ctx: any, config: Config): void {
           }
         } else {
           message += ` ${remaining} obligation(s) remain (phase ${next.state.phase}).`
-          // PUSH INVERSION: when the plan still has dispatchable work and the
-          // queue is ready/idle, the plan drives execution itself — dispatch the
-          // next segment (TASK_DISPATCHED event), inject the execution envelope
-          // into the agent loop, and wake it, instead of waiting for the user to
-          // pull via iq_execute_next again. The envelope's source is plugin kind,
-          // so autoCapture never captures it.
-          const t = nextDispatchable(next.state)
-          if (t !== null && next.state.active_task_id === null) {
-            const aId = `A${t.attempts.length + 1}`
-            const dispatchEvt: IQEvent = {
-              kind: 'TASK_DISPATCHED', seq: -1, run_id: sessionId, ts: nowIso(),
-              task_id: t.task_id, attempt_id: aId,
-            }
-            const afterDispatch = commitEvents(sessionId, next.events, [dispatchEvt])
-            // PUSH INVERSION (GPT-verified rc.8 pattern): the segment is now
-            // dispatched. Construct a full UserMessage with a FRESH id via
-            // createUserMessage and followup() it — the agent's next turn claims
-            // and executes the envelope directly (no iq_execute_next pull, no
-            // inbox residue). createUserMessage gives a randomUUID id +
-            // role:'user' + source {kind:'plugin', plugin:...}; the id MUST be
-            // fresh and never recycled from the plan id (inbox dedupes globally
-            // across both queues by MessageId).
-            pushEnvelope(exec.agent, afterDispatch.state, t.task_id, aId)
-          }
+          // IDLE-GATED PUSH: the plan still has dispatchable work, but we do
+          // NOT followup() from inside this tool (that would hide a human
+          // interjection behind our envelope — Inbox.claim takes only the FIFO
+          // head of nextTurn). Instead, request a drive; the external idle
+          // driver dispatches the next segment once the agent converges to
+          // idle and no competing user input is queued.
+          requestDriveForAgent(exec.agent)
         }
         return {
           ok: true,
@@ -1090,6 +1250,129 @@ export function apply(ctx: any, config: Config): void {
       }
     }, 'dsh-instruction-queue: autoCapture pre-step')
   }
+
+  // ── idle-gated driver: lifecycle + race-fence listeners ──────────────────
+  // Registered unconditionally (push execution + live intake are core, not
+  // gated by config.autoCapture). The composite effect keeps the fences
+  // installed until the plugin's own scheduling tasks settle.
+  ctx.effect(function* () {
+    ctx.on('agent/created', ({ agent }: { agent: { id: string } }) => {
+      const state = stateForSession(String(agent.id))
+      const live = resolveLiveAgent(String(agent.id))
+      if (live !== undefined) state.agent = live
+    })
+    ctx.on('agent/disposed', ({ agent }: { agent: { id: string } }) => {
+      driverStates.delete(String(agent.id))
+    })
+    ctx.on('agent/status', ({ agent, status }: { agent: { id: string }; status: 'idle' | 'running' }) => {
+      const state = stateForSession(String(agent.id))
+      const live = resolveLiveAgent(String(agent.id))
+      if (live !== undefined) state.agent = live
+      if (status === 'idle') {
+        state.competingQueued = false
+        requestDrive(state)
+      }
+    })
+    ctx.on('agent/inbox/inserted', ({ agent, message }: {
+      agent: { id: string; inbox?: { nextTurn?: readonly { id?: string }[] } }
+      message: { id?: string; content?: unknown; source?: { kind?: string; plugin?: string } }
+    }) => {
+      // Only competing ORDINARY input matters; our own envelope is excluded.
+      const inbox = agent.inbox
+      if (inbox === undefined) return
+      const pending = inbox.nextTurn ?? []
+      if (!pending.some((c) => c.id !== undefined && c.id === message.id)) return
+      const isOurs = message.source?.kind === 'plugin' && message.source.plugin === 'dsh-instruction-queue'
+      if (isOurs) return
+      const state = stateForSession(String(agent.id))
+      state.competingQueued = true
+      if (state.attempt?.phase === 'queued') state.attempt.stale = true
+    })
+    ctx.on('agent/inbox/claimed', ({ agent, message }: {
+      agent: { id: string }
+      message: { id?: string }
+    }) => {
+      const state = stateForSession(String(agent.id))
+      const attempt = state.attempt
+      if (attempt !== undefined && message.id === attempt.messageId) attempt.phase = 'claimed'
+    })
+
+    ctx.on('agent/pre-step', async ({ agent, messages, signal }: {
+      agent: { id: string; session?: { id?: unknown } }
+      messages: readonly { id?: string; content?: unknown; source?: { kind?: string; plugin?: string } }[]
+      signal?: AbortSignal
+    }, next: () => Promise<unknown>): Promise<unknown> => {
+      try {
+        const sessionId = agent.session?.id
+        if (sessionId === undefined || sessionId === null) return next()
+        const id = String(sessionId)
+        const state = stateForSession(id)
+        const live = resolveLiveAgent(id)
+        if (live !== undefined) state.agent = live
+        const batch = [...messages]
+
+        // 1) STALE RESERVATION: if our envelope was claimed but the attempt is
+        //    stale (a human prompt arrived after we reserved), drop it and
+        //    restore the other claimed records, then reject so the competing
+        //    human input gets its own turn.
+        const submitted = batch.find((m) => m.source?.kind === 'plugin' && m.source.plugin === 'dsh-instruction-queue')
+        if (submitted !== undefined && state.attempt !== undefined && submitted.id === state.attempt.messageId) {
+          const attempt = state.attempt
+          if (attempt.stale || !readyToDrive(state)) {
+            attempt.stale = true
+            state.attempt = undefined
+            restoreOtherClaimed(live, batch, submitted.id)
+            requestDrive(state)
+            return { kind: 'reject' }
+          }
+        }
+
+        // 2) LIVE INTAKE: buffer human text inputs while the plan is active.
+        //    A claimed batch may mix our envelope + human deltas + steering;
+        //    only swallow when the batch is PURE human intake (spend no model
+        //    call), otherwise restore the non-human records.
+        const run = runs.get(id)
+        if (run !== undefined && run.state.enabled
+          && run.state.phase !== 'completed' && run.state.phase !== 'aborted') {
+          const deltas = batch.filter((m) => isCaptureCandidate(m))
+          if (deltas.length > 0) {
+            const texts = deltas.map(textOfMessage).filter((t) => t.length > 0)
+              .filter((t) => !isControlUtterance(t))
+            if (texts.length > 0) {
+              const startSeq = run.state.inputs.length
+              const ts = nowIso()
+              const evts: IQEvent[] = texts.map((content, i) => ({
+                kind: 'INPUT_BUFFERED' as const,
+                seq: -1,
+                run_id: id,
+                ts,
+                input_id: `IN${startSeq + i + 1}`,
+                content,
+                queue_sequence: startSeq + i + 1,
+                last_visible_event_id: null,
+                session_id: id,
+              }))
+              commitEvents(id, run.events, evts)
+              // eslint-disable-next-line no-console
+              console.log(`[dsh-instruction-queue] driver: live intake buffered ${texts.length} (phase=${run.state.phase})`)
+            }
+            // Only spend no model call when the whole claimed batch was human.
+            const humanIds = new Set(deltas.map((m) => m.id))
+            const allHuman = batch.every((m) => m.id === undefined || humanIds.has(m.id))
+            if (allHuman && texts.length > 0) {
+              requestDrive(state)
+              return { kind: 'enter', messages: [] }
+            }
+          }
+        }
+        return next()
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.log(`[dsh-instruction-queue] driver pre-step error: ${e instanceof Error ? e.message : String(e)}`)
+        return next()
+      }
+    }, 'dsh-instruction-queue: driver pre-step')
+  }, 'dsh-instruction-queue: driver lifecycle')
 }
 
 /** True when every approved obligation is resolved (completion gate). */
@@ -1122,6 +1405,28 @@ function isControlUtterance(text: string): boolean {
   return /^\/iq\b/i.test(t)
     || /^(开始|开始吧|开始执行|编译|批准|审批|暂停|继续|停止|终止|状态|进度)$/.test(t)
     || /^(start|compile|approve|pause|resume|abort|status|go)$/i.test(t)
+}
+
+/**
+ * When the driver drops only its own stale envelope from a claimed batch,
+ * restore the OTHER claimed messages to next-step so they are not lost
+ * (goal-round-driver's restoreOtherClaimed pattern). `agent` must be the
+ * live agent (its inbox has the pending queues).
+ */
+function restoreOtherClaimed(
+  agent: AgentLike | undefined,
+  messages: readonly { id?: string; content?: unknown; source?: { kind?: string; plugin?: string } }[],
+  messageId: string,
+): void {
+  if (agent === undefined || agent.inbox?.prepend === undefined) return
+  const retained = messages.filter((m) => m.id !== messageId
+    && !(m.source?.kind === 'plugin' && m.source.plugin === 'dsh-instruction-queue'))
+  for (const message of retained.toReversed()) {
+    const inNextStep = (agent.inbox.nextStep ?? []).some((c) => c.id === message.id)
+    const inNextTurn = (agent.inbox.nextTurn ?? []).some((c) => c.id === message.id)
+    if (inNextStep || inNextTurn) continue
+    agent.inbox.prepend('next-step', message)
+  }
 }
 
 /**
@@ -1160,39 +1465,28 @@ function envelopeFor(task: Task, attemptId: string): {
   }
 }
 
-/**
- * PUSH INVERSION: after reconcile, build a full UserMessage with a FRESH id
- * (createUserMessage → randomUUID) carrying the complete execution envelope,
- * and followup() it so the agent's next turn executes the segment directly.
- * GPT-verified rc.8 pattern — see Agent.followup / Inbox dedupe: the id must
- * be unique per message and NEVER recycled from the plan/task id, since Inbox
- * dedupes globally across 'next-turn' AND 'next-step' by MessageId. The plan
- * is the executor of record; the agent is a per-segment worker.
- */
-function pushEnvelope(
-  agent: ExecCtx['agent'],
-  state: RunState,
-  taskId: string,
-  attemptId: string,
-): void {
-  if (agent === undefined) return
-  if (typeof agent.followup !== 'function') return
-  const t = state.tasks.find((x) => x.task_id === taskId)
-  if (t === undefined) return
-  const criteria = t.acceptance_criteria.map((c, i) => `${i + 1}. ${c.text}`).join('\n')
-  const text = `[Instructions Queue] Execute the approved segment (${taskId}, attempt ${attemptId}).\n\n`
-    + `TASK: ${t.task}\n`
-    + `intent: ${t.intent_type} | targets: ${t.targets.join(', ')} | side-effect: ${t.side_effect_class}\n\n`
+/** Build a full UserMessage with a FRESH id carrying the execution envelope. */
+function buildEnvelopeMessage(task: Task, attemptId: string): {
+  id: string
+  content: { type: 'text'; text: string }[]
+  source: { kind: 'plugin'; plugin: string }
+} {
+  const criteria = task.acceptance_criteria.map((c, i) => `${i + 1}. ${c.text}`).join('\n')
+  const text = `[Instructions Queue] Execute the approved segment (${task.task_id}, attempt ${attemptId}).\n\n`
+    + `TASK: ${task.task}\n`
+    + `intent: ${task.intent_type} | targets: ${task.targets.join(', ')} | side-effect: ${task.side_effect_class}\n\n`
     + `ACCEPTANCE CRITERIA:\n${criteria}\n\n`
     + 'Execute exactly this task in the main session; do not advance other queue tasks. '
-    + `When done, call iq_reconcile ONCE with { task_id: "${taskId}", attempt_id: "${attemptId}", result_summary, evidence, criteria }.`
+    + `When done, call iq_reconcile ONCE with { task_id: "${task.task_id}", attempt_id: "${attemptId}", result_summary, evidence, criteria }.`
   const message = createUserMessage({
     content: [{ type: 'text', text }],
     source: { kind: 'plugin', plugin: 'dsh-instruction-queue' },
   })
-  agent.followup(message)
-  // eslint-disable-next-line no-console
-  console.log(`[dsh-instruction-queue] push: followup envelope ${taskId} (${attemptId})`)
+  return {
+    id: message.id,
+    content: message.content,
+    source: message.source,
+  }
 }
 
 /**
