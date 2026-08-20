@@ -37,7 +37,7 @@ import type { ReconcileEvidence } from './reconcile.ts'
 
 export const name = 'dsh-instruction-queue'
 
-export const inject = ['tools']
+export const inject = ['tools', 'llm']
 
 /** Plugin configuration. */
 export interface Config {
@@ -74,9 +74,11 @@ export const Config: z<Config> = z.object({
 /** Resolve the ledger root: explicit config, else the portable default. */
 export function resolveDataDir(configDataDir: string): string {
   if (configDataDir.length > 0) return configDataDir
-  // Never hardcode a user-specific path — Node's homedir() is the portable
-  // source (Windows USERPROFILE / POSIX $HOME under the hood).
-  return join(homedir(), '.dsh', 'storages', 'instruction-queue')
+  // Prefer the harness home ($DSH_HOME) so a test/isolated instance keeps its
+  // ledger inside its OWN home instead of polluting the default user home;
+  // fall back to os.homedir()/.dsh. Never hardcode a user-specific path.
+  const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  return join(home, 'storages', 'instruction-queue')
 }
 
 /** A registered tool's execute context (subset we rely on). */
@@ -172,7 +174,7 @@ export function apply(ctx: any, config: Config): void {
         const sessionId = sessionOf(exec)
         const run = loadRun(sessionId)
         if (run === null) {
-          return { active: false, phase: 'idle', input_count: 0, approved_count: 0, resolved_count: 0, next_task_id: null, recovery_note: null }
+          return { active: false, phase: 'idle', input_count: 0, approved_count: 0, resolved_count: 0, next_task_id: '', recovery_note: '' }
         }
         const approved = approvedObligations(run.state)
         const resolved = approved.filter((t) => ['satisfied', 'covered', 'skipped'].includes(t.resolution_status)).length
@@ -183,8 +185,10 @@ export function apply(ctx: any, config: Config): void {
           input_count: run.state.inputs.length,
           approved_count: approved.length,
           resolved_count: resolved,
-          next_task_id: next?.task_id ?? null,
-          recovery_note: run.state.recovery_note,
+          // DSH schema accepts only single types (no ['string','null']), so
+          // null becomes '' (render already tolerates empty via ??).
+          next_task_id: next?.task_id ?? '',
+          recovery_note: run.state.recovery_note ?? '',
         }
       },
     },
@@ -619,20 +623,23 @@ export function apply(ctx: any, config: Config): void {
       },
       async execute(_args: Record<string, never>, exec: ExecCtx) {
         const sessionId = sessionOf(exec)
-        if (sessionId === '') return { ok: false, task_id: null, attempt_id: null, envelope: null, message: 'iq_execute_next requires an owning agent session.' }
+        // Failure returns omit the nullable task_id/attempt_id/envelope fields
+        // entirely (DSH schema is single-typed; non-required fields may be
+        // absent, but may NOT be null). The renderer shows message on !ok.
+        if (sessionId === '') return { ok: false, message: 'iq_execute_next requires an owning agent session.' }
         const run = loadRun(sessionId)
-        if (run === null) return { ok: false, task_id: null, attempt_id: null, envelope: null, message: 'No active queue.' }
+        if (run === null) return { ok: false, message: 'No active queue.' }
         const state = run.state
         if (state.phase !== 'ready' && state.phase !== 'executing' && state.phase !== 'reconciling') {
-          return { ok: false, task_id: null, attempt_id: null, envelope: null, message: `Queue is ${state.phase} — cannot dispatch now.` }
+          return { ok: false, message: `Queue is ${state.phase} — cannot dispatch now.` }
         }
         if (state.active_task_id !== null) {
-          return { ok: false, task_id: null, attempt_id: null, envelope: null, message: `Task ${state.active_task_id} is already active — finish it (iq_reconcile) first.` }
+          return { ok: false, message: `Task ${state.active_task_id} is already active — finish it (iq_reconcile) first.` }
         }
         const task = nextDispatchable(state)
         if (task === null) {
           const done = allResolved(state)
-          return { ok: false, task_id: null, attempt_id: null, envelope: null, message: done ? 'All approved obligations resolved — queue complete.' : 'No dispatchable task (check dependencies / approvals).' }
+          return { ok: false, message: done ? 'All approved obligations resolved — queue complete.' : 'No dispatchable task (check dependencies / approvals).' }
         }
         const attemptId = `A${task.attempts.length + 1}`
         const ts = nowIso()

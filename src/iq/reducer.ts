@@ -401,8 +401,15 @@ export function allApprovedResolved(state: RunState): boolean {
 /** Find the next dispatchable task (topological, dependency-aware). */
 export function nextDispatchable(state: RunState): Task | null {
   if (state.active_task_id !== null) return null // invariant #7
-  const candidates = executableTasks(state)
-    .filter((t) => t.execution_status === 'pending' || t.execution_status === 'failed')
+  // Dispatchable = approved/executable task that is NOT yet resolved (open/
+  // partial) and not running. A finished-but-open task (reconcile returned
+  // partial/open because criteria weren't fully met) may be re-dispatched for
+  // another attempt — this lets the executor keep working a partially-satisfied
+  // obligation to completion instead of getting stuck.
+  const candidates = executableTasks(state).filter((t) =>
+    (t.execution_status === 'pending' || t.execution_status === 'failed')
+    || (t.execution_status === 'finished' && (t.resolution_status === 'open' || t.resolution_status === 'partial')),
+  )
   const resolvedIds = new Set(
     executableTasks(state)
       .filter((t) => t.resolution_status === 'satisfied' || t.resolution_status === 'covered')
