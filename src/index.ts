@@ -89,6 +89,8 @@ interface ExecCtx {
       id?: unknown
       requestHeader?: () => { config?: { provider?: string; model?: string } }
     }
+    /** Push-driven dispatch: inject the next execution envelope and wake the loop. */
+    followup?: (input: { content: unknown; source?: unknown }) => void
   }
 }
 
@@ -932,6 +934,12 @@ export function apply(ctx: any, config: Config): void {
           }
         } else {
           message += ` ${remaining} obligation(s) remain (phase ${next.state.phase}).`
+          // PUSH INVERSION: when the plan still has dispatchable work and the
+          // queue is ready/idle, the plan drives execution itself — inject the
+          // next segment's execution envelope and wake the agent loop, instead
+          // of waiting for the user to pull via iq_execute_next again. The
+          // envelope's source is plugin kind, so autoCapture never captures it.
+          pushNextSegment(exec.agent, next.state)
         }
         return {
           ok: true,
@@ -1041,6 +1049,40 @@ function isControlUtterance(text: string): boolean {
   return /^\/iq\b/i.test(t)
     || /^(开始|开始吧|开始执行|编译|批准|审批|暂停|继续|停止|终止|状态|进度)$/.test(t)
     || /^(start|compile|approve|pause|resume|abort|status|go)$/i.test(t)
+}
+
+/**
+ * PUSH INVERSION: after a segment reconciles, if the plan still owns
+ * dispatchable, unexecuted work, drive execution forward by injecting the next
+ * execution envelope into the agent loop and waking it — no user message
+ * required. This is the design's outer loop: the plan is the executor of
+ * record; the agent is a per-segment worker.
+ */
+function pushNextSegment(
+  agent: ExecCtx['agent'],
+  state: RunState,
+): void {
+  if (agent === undefined) return
+  if (typeof agent.followup !== 'function') return
+  if (state.active_task_id !== null) return // invariant #7: one owner at a time
+  const next = nextDispatchable(state)
+  if (next === null) return
+  // The envelope is a plugin-authored prompt the agent executes as its next
+  // segment. Same shape as iq_execute_next's envelope so behavior is uniform.
+  const taskText = next.task
+  const criteria = next.acceptance_criteria.map((c, i) => `${i + 1}. ${c.text}`).join('\n')
+  const text = `[Instructions Queue] Execute the next approved segment (${next.task_id}).\n\n`
+    + `TASK: ${taskText}\n`
+    + `intent: ${next.intent_type} | targets: ${next.targets.join(', ')} | side-effect: ${next.side_effect_class}\n\n`
+    + `ACCEPTANCE CRITERIA:\n${criteria}\n\n`
+    + 'Execute exactly this segment in the main session. Do NOT advance other queue tasks. '
+    + `After executing, report the result via iq_reconcile (task_id "${next.task_id}", e.g. attempt "A${next.attempts.length + 1}").`
+  agent.followup({
+    content: [{ type: 'text', text }],
+    source: { kind: 'plugin', plugin: 'dsh-instruction-queue', execution: true },
+  })
+  // eslint-disable-next-line no-console
+  console.log(`[dsh-instruction-queue] push: dispatched execution envelope for ${next.task_id} to the agent`)
 }
 
 /**
