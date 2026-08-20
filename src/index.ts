@@ -30,7 +30,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { IQEvent } from './iq/events.ts'
 import { appendEvents, assignSeqs, loadLedger } from './iq/ledger.ts'
-import { allApprovedResolved, approvedObligations, nextDispatchable, reduceAll } from './iq/reducer.ts'
+import { allApprovedResolved, approvedObligations, executableTasks, nextDispatchable, reduceAll } from './iq/reducer.ts'
 import { auditCoverage } from './iq/invariants.ts'
 import type { RunState, Task } from './iq/types.ts'
 import type { ReconcileEvidence } from './reconcile.ts'
@@ -669,6 +669,26 @@ export function apply(ctx: any, config: Config): void {
         if (state.phase !== 'ready' && state.phase !== 'executing' && state.phase !== 'reconciling') {
           return { ok: false, message: `Queue is ${state.phase} — cannot dispatch now.` }
         }
+        // IDEMPOTENT DISPATCH (push/pull unify): if a task already has a
+        // dispatched-but-not-reconciled attempt (the plan push-ran ahead and
+        // wrote TASK_DISPATCHED), return that task's live envelope WITHOUT
+        // writing a second TASK_DISPATCHED. This lets the agent pull the exact
+        // same envelope the plan pushed — no double dispatch, no pending
+        // conflict. The latest such task is the one the plan dispatched.
+        const dispatchedPending = executableTasks(state).find((t) =>
+          t.attempts.length > 0 && t.attempts[t.attempts.length - 1]!.status === 'dispatched'
+          && (t.resolution_status === 'open' || t.resolution_status === 'partial'),
+        )
+        if (dispatchedPending !== undefined) {
+          const aId = dispatchedPending.attempts[dispatchedPending.attempts.length - 1]!.attempt_id
+          return {
+            ok: true,
+            task_id: dispatchedPending.task_id,
+            attempt_id: aId,
+            envelope: envelopeFor(dispatchedPending, aId),
+            message: `Returning already-dispatched segment ${dispatchedPending.task_id} (${aId}) — no new dispatch.`,
+          }
+        }
         if (state.active_task_id !== null) {
           return { ok: false, message: `Task ${state.active_task_id} is already active — finish it (iq_reconcile) first.` }
         }
@@ -688,16 +708,7 @@ export function apply(ctx: any, config: Config): void {
           { kind: 'TASK_DISPATCHED', seq: -1, run_id: sessionId, ts, task_id: task.task_id, attempt_id: attemptId },
         ]
         const next = commitEvents(sessionId, run.events, evts)
-        const envelope = {
-          task: task.task,
-          intent_type: task.intent_type,
-          targets: task.targets,
-          acceptance_criteria: task.acceptance_criteria.map((c) => c.text),
-          hard_dependencies: task.hard_dependencies,
-          side_effect_class: task.side_effect_class,
-          instruction: `Execute exactly this segment in the main session. Do NOT advance other queue tasks. `
-            + `After executing, call iq_reconcile with { task_id: "${task.task_id}", attempt_id: "${attemptId}", result: ... }.`,
-        }
+        const envelope = envelopeFor(task, attemptId)
         return { ok: true, task_id: task.task_id, attempt_id: attemptId, envelope, message: `Dispatched ${task.task_id} (${attemptId}).` }
       },
     },
@@ -1059,6 +1070,28 @@ function isControlUtterance(text: string): boolean {
   return /^\/iq\b/i.test(t)
     || /^(开始|开始吧|开始执行|编译|批准|审批|暂停|继续|停止|终止|状态|进度)$/.test(t)
     || /^(start|compile|approve|pause|resume|abort|status|go)$/i.test(t)
+}
+
+/** Build the model-facing execution envelope for a dispatched task. */
+function envelopeFor(task: Task, attemptId: string): {
+  task: string
+  intent_type: string
+  targets: string[]
+  acceptance_criteria: string[]
+  hard_dependencies: string[]
+  side_effect_class: string
+  instruction: string
+} {
+  return {
+    task: task.task,
+    intent_type: task.intent_type,
+    targets: task.targets,
+    acceptance_criteria: task.acceptance_criteria.map((c) => c.text),
+    hard_dependencies: task.hard_dependencies,
+    side_effect_class: task.side_effect_class,
+    instruction: `Execute exactly this segment in the main session. Do NOT advance other queue tasks. `
+      + `After executing, call iq_reconcile with { task_id: "${task.task_id}", attempt_id: "${attemptId}", result: ... }.`,
+  }
 }
 
 /**
