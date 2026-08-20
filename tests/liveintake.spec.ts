@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest'
 import type { IQEvent } from '../src/iq/events.ts'
 import { initialRunState, reduce } from '../src/iq/reducer.ts'
-import { pendingDeltaInputs } from '../src/index.ts'
+import { pendingDeltaInputs, sanitizeModelEvidence } from '../src/index.ts'
 import type { RunState } from '../src/iq/types.ts'
 
 const SID = 'sess-test'
@@ -61,5 +61,30 @@ describe('pendingDeltaInputs (live intake)', () => {
       conflicts: [], dependency_cycles: [], ambiguities: [],
     })
     expect(pendingDeltaInputs(s)).toEqual([])
+  })
+})
+
+describe('sanitizeModelEvidence (P0#2 evidence authority firewall)', () => {
+  it('downgrades every model authority claim to agent_conclusion/agent', () => {
+    const out = sanitizeModelEvidence([
+      { id: 'E1', type: 'file_change', path: 'x.ts', authority: 'tool' },
+      { id: 'E2', type: 'command_result', command: 'npm test', exit_code: 0, authority: 'tool' },
+      { id: 'E3', type: 'agent_conclusion', authority: 'agent', note: 'i verified it' },
+    ])
+    expect(out).toHaveLength(3)
+    for (const e of out) {
+      expect(e.type).toBe('agent_conclusion')
+      expect(e.authority).toBe('agent')
+    }
+    // model can never mint tool/workspace authority
+    expect(out.some((e) => e.authority === 'tool')).toBe(false)
+    // note preserved for the agent-conclusion
+    expect(out.find((e) => e.id === 'E3')?.note).toBe('i verified it')
+  })
+
+  it('assigns an id when the model omitted none', () => {
+    const out = sanitizeModelEvidence([{ id: '', type: 'file_change', authority: 'workspace' }])
+    expect(out[0]!.id).toMatch(/^model-ev-\d+$/)
+    expect(out[0]!.authority).toBe('agent')
   })
 })

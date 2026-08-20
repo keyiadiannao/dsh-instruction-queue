@@ -1022,7 +1022,15 @@ export function apply(ctx: any, config: Config): void {
         // this is the moment the attempt truly started (and now finished).
         // In the crash window (dispatch, crash, no reconcile) the attempt
         // stays 'dispatched' and recovery.ts treats it as uncertain.
-        const evid = Array.isArray(args.evidence) ? args.evidence : []
+        // P0#2 evidence authority: the MODEL must never mint `tool`/`workspace`
+        // authority — coverage is only provable by real Harness tool outcomes,
+        // never by the agent's self-report. Model-supplied evidence is sanitized
+        // to the weakest form: type `agent_conclusion`, authority `agent`. Any
+        // claim of file_change / command_result / workspace_state / tool
+        // authority from the model is dropped (the reconcile LLM judges only
+        // against SYSTEM-captured evidence, which we merge below).
+        const rawEvid = Array.isArray(args.evidence) ? args.evidence : []
+        const evid = sanitizeModelEvidence(rawEvid)
         const preEvents: IQEvent[] = []
         if (attempt.status === 'dispatched') {
           preEvents.push({
@@ -1033,9 +1041,11 @@ export function apply(ctx: any, config: Config): void {
         // SIDE_EFFECT_OBSERVED: a write/external/irreversible side effect that
         // reconcile can prove from captured evidence (file changes, external
         // calls, workspace mutations). Agent conclusions alone never count.
-        const observedEffect = evid.some((e) => e.type === 'file_change' || e.type === 'workspace_state')
+        // Judged from the RAW model report (the agent can truthfully say it
+        // performed a write), NOT from sanitized coverage evidence.
+        const observedEffect = rawEvid.some((e) => e.type === 'file_change' || e.type === 'workspace_state')
           ? 'write'
-          : evid.some((e) => e.type === 'external')
+          : rawEvid.some((e) => e.type === 'external')
             ? 'external'
             : null
         if (observedEffect !== null) {
@@ -1057,15 +1067,13 @@ export function apply(ctx: any, config: Config): void {
           task_id: task.task_id,
           attempt_id: attempt.attempt_id,
           result_summary: typeof args.result_summary === 'string' && args.result_summary.length > 0 ? args.result_summary : null,
+          // Sanitized model evidence: type agent_conclusion / authority agent
+          // (P0#2 — the model cannot self-certify tool/workspace authority).
           evidence: evid.map((e) => ({
             id: e.id,
             type: e.type,
-            ...(e.path !== undefined ? { path: e.path } : {}),
-            ...(e.command !== undefined ? { command: e.command } : {}),
-            ...(e.exit_code !== undefined ? { exit_code: e.exit_code } : {}),
-            observed_at: ts,
+            observed_at: e.observed_at,
             authority: e.authority,
-            ...(e.artifact_version !== undefined ? { artifact_version: e.artifact_version } : {}),
             ...(e.note !== undefined ? { note: e.note } : {}),
           })),
         }
@@ -1479,6 +1487,32 @@ function textOfMessage(m: { content?: unknown }): string {
       ? (b as { text?: string }).text ?? ''
       : '')
     .join('\n')
+}
+
+/**
+ * P0#2 evidence authority firewall. The MODEL must never mint
+ * `tool`/`workspace` evidence authority — coverage is only provable by real
+ * Harness tool outcomes, never by the agent's self-report. Model-supplied
+ * evidence is reduced to the weakest form: type `agent_conclusion`, authority
+ * `agent`, and only the note/summary content is kept. Any claim of
+ * file_change / command_result / workspace_state / external / tool authority
+ * from the model is dropped — it cannot self-certify coverage.
+ */
+export function sanitizeModelEvidence(ev: {
+  id?: string; type: string; path?: string; command?: string; exit_code?: number
+  authority: string; artifact_version?: string; note?: string
+}[]): {
+  id: string; type: 'agent_conclusion'; authority: 'agent'; observed_at: string; note?: string
+}[] {
+  return ev
+    .filter((e) => e && typeof e === 'object')
+    .map((e, i) => ({
+      id: typeof e.id === 'string' && e.id.length > 0 ? e.id : `model-ev-${i}`,
+      type: 'agent_conclusion' as const,
+      authority: 'agent' as const,
+      observed_at: new Date().toISOString(),
+      ...(typeof e.note === 'string' && e.note.length > 0 ? { note: e.note } : {}),
+    }))
 }
 
 /** SHA-256 hex of a string — used to map a session id to a fixed-length,
