@@ -9,3 +9,6 @@ coverage/
 
 # Logs
 *.log
+
+# Test artifacts
+examples/
