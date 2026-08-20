@@ -76,8 +76,8 @@ describe('sanitizeModelEvidence (P0#2 evidence authority firewall)', () => {
       expect(e.type).toBe('agent_conclusion')
       expect(e.authority).toBe('agent')
     }
-    // model can never mint tool/workspace authority
-    expect(out.some((e) => e.authority === 'tool')).toBe(false)
+    // model can never mint tool/workspace authority (every entry is 'agent')
+    expect(out.every((e) => e.authority === 'agent')).toBe(true)
     // note preserved for the agent-conclusion
     expect(out.find((e) => e.id === 'E3')?.note).toBe('i verified it')
   })
