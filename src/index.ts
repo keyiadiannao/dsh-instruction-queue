@@ -32,7 +32,7 @@ import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import type { IQEvent } from './iq/events.ts'
 import { appendEvents, assignSeqs, loadLedger } from './iq/ledger.ts'
-import { allApprovedResolved, approvedObligations, executableTasks, nextDispatchable, reduceAll } from './iq/reducer.ts'
+import { allApprovedResolved, approvedObligations, executableTasks, initialRunState, nextDispatchable, reduceAll } from './iq/reducer.ts'
 import { auditCoverage } from './iq/invariants.ts'
 import type { RawInput, RunState, Task } from './iq/types.ts'
 import type { ReconcileEvidence } from './reconcile.ts'
@@ -146,7 +146,9 @@ export function apply(ctx: any, config: Config): void {
     return id === undefined || id === null ? '' : String(id)
   }
 
-  /** Load (or re-load) a session's run from its ledger file. */
+  /**
+   * Load (or re-load) a session's run from its ledger file.
+   */
   const loadRun = (sessionId: string): { events: IQEvent[]; state: RunState } | null => {
     if (sessionId === '') return null
     const cached = runs.get(sessionId)
@@ -159,13 +161,41 @@ export function apply(ctx: any, config: Config): void {
     return entry
   }
 
-  /** Append events to the ledger + cache; returns the new run (events + state). */
-  const commitEvents = (sessionId: string, events: IQEvent[], added: IQEvent[]): { events: IQEvent[]; state: RunState } => {
-    if (added.length === 0) return { events, state: reduceAll(events) }
-    const seq = events.length
+  /**
+   * Append events to the ledger as a single-writer TRANSACTION.
+   *
+   * The caller-supplied `events` array is IGNORED as authoritative — we always
+   * re-read the CURRENT tail from the `runs` cache (which is kept in sync with
+   * the on-disk ledger) so a caller may NOT carry a stale event array across an
+   * `await` (reconcile does: capture → await LLM → commit). If another path
+   * (live intake) appended INPUT_BUFFERED during that await, we still derive
+   * the correct next seq and keep those events in the projection — no duplicate
+   * seq, no cache that silently omits ledger events.
+   *
+   * Ordering: construct candidate → REDUCE/VALIDATE the full candidate ledger
+   * (throws on invariant violation) → only then durable-append to disk →
+   * publish the projection. Invalids never become durable (fix: prior code
+   * appended before validating).
+   */
+  const commitEvents = (sessionId: string, _events: IQEvent[], added: IQEvent[]): { events: IQEvent[]; state: RunState } => {
+    if (added.length === 0) {
+      const cur = runs.get(sessionId)
+      if (cur !== undefined) return cur
+      const loaded = loadRun(sessionId)
+      return loaded ?? { events: [] as IQEvent[], state: initialRunState(sessionId, sessionId) }
+    }
+    // Authoritative current tail: live cache first, else fresh from disk.
+    const current = runs.get(sessionId)
+      ?? { events: loadLedger(ledgerOf(sessionId)), state: loadRun(sessionId)?.state ?? initialRunState(sessionId, sessionId) }
+    const baseEvents = current.events
+    const seq = baseEvents.length
     const stamped = assignSeqs(added, seq) as IQEvent[]
+    // VALIDATE BEFORE PERSIST: a candidate that violates an invariant throws
+    // here and is never written. (fix: prior code appended then reduced.)
+    const all = [...baseEvents, ...stamped]
+    reduceAll(all)
+    // Durable append, then publish projection (cache is authoritative tail).
     appendEvents(ledgerOf(sessionId), stamped)
-    const all = [...events, ...stamped]
     const state = reduceAll(all)
     const entry = { events: all, state }
     runs.set(sessionId, entry)
