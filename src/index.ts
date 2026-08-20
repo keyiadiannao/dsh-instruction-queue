@@ -26,6 +26,7 @@
  */
 
 import z from '@deepseek-ai/schemastery'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { IQEvent } from './iq/events.ts'
@@ -959,6 +960,14 @@ export function apply(ctx: any, config: Config): void {
               task_id: t.task_id, attempt_id: aId,
             }
             const afterDispatch = commitEvents(sessionId, next.events, [dispatchEvt])
+            // PUSH INVERSION (GPT-verified rc.8 pattern): the segment is now
+            // dispatched. Construct a full UserMessage with a FRESH id via
+            // createUserMessage and followup() it — the agent's next turn claims
+            // and executes the envelope directly (no iq_execute_next pull, no
+            // inbox residue). createUserMessage gives a randomUUID id +
+            // role:'user' + source {kind:'plugin', plugin:...}; the id MUST be
+            // fresh and never recycled from the plan id (inbox dedupes globally
+            // across both queues by MessageId).
             pushEnvelope(exec.agent, afterDispatch.state, t.task_id, aId)
           }
         }
@@ -1095,10 +1104,13 @@ function envelopeFor(task: Task, attemptId: string): {
 }
 
 /**
- * PUSH INVERSION: inject the dispatch envelope into the agent loop and wake it.
- * The caller has already written the TASK_DISPATCHED event and holds the
- * dispatch state; this only builds the model-facing envelope and wakes the
- * loop. The plan is the executor of record; the agent is a per-segment worker.
+ * PUSH INVERSION: after reconcile, build a full UserMessage with a FRESH id
+ * (createUserMessage → randomUUID) carrying the complete execution envelope,
+ * and followup() it so the agent's next turn executes the segment directly.
+ * GPT-verified rc.8 pattern — see Agent.followup / Inbox dedupe: the id must
+ * be unique per message and NEVER recycled from the plan/task id, since Inbox
+ * dedupes globally across 'next-turn' AND 'next-step' by MessageId. The plan
+ * is the executor of record; the agent is a per-segment worker.
  */
 function pushEnvelope(
   agent: ExecCtx['agent'],
@@ -1111,20 +1123,19 @@ function pushEnvelope(
   const t = state.tasks.find((x) => x.task_id === taskId)
   if (t === undefined) return
   const criteria = t.acceptance_criteria.map((c, i) => `${i + 1}. ${c.text}`).join('\n')
-  const text = `[Instructions Queue] Execute the approved segment (${taskId}).\n\n`
+  const text = `[Instructions Queue] Execute the approved segment (${taskId}, attempt ${attemptId}).\n\n`
     + `TASK: ${t.task}\n`
     + `intent: ${t.intent_type} | targets: ${t.targets.join(', ')} | side-effect: ${t.side_effect_class}\n\n`
     + `ACCEPTANCE CRITERIA:\n${criteria}\n\n`
-    + `This segment has ALREADY BEEN DISPATCHED by the plan (attempt ${attemptId}). `
-    + 'Do NOT call iq_execute_next or iq_execute again — the dispatch already happened. '
     + 'Execute exactly this task in the main session; do not advance other queue tasks. '
-    + `When the task is done, call iq_reconcile ONCE with { task_id: "${taskId}", attempt_id: "${attemptId}", result_summary, evidence, criteria }.`
-  agent.followup({
+    + `When done, call iq_reconcile ONCE with { task_id: "${taskId}", attempt_id: "${attemptId}", result_summary, evidence, criteria }.`
+  const message = createUserMessage({
     content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: 'dsh-instruction-queue', execution: true },
+    source: { kind: 'plugin', plugin: 'dsh-instruction-queue' },
   })
+  agent.followup(message)
   // eslint-disable-next-line no-console
-  console.log(`[dsh-instruction-queue] push: dispatched envelope ${taskId} (${attemptId}) to the agent`)
+  console.log(`[dsh-instruction-queue] push: followup envelope ${taskId} (${attemptId})`)
 }
 
 /**
