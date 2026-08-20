@@ -33,7 +33,7 @@ import type { IQEvent } from './iq/events.ts'
 import { appendEvents, assignSeqs, loadLedger } from './iq/ledger.ts'
 import { allApprovedResolved, approvedObligations, executableTasks, nextDispatchable, reduceAll } from './iq/reducer.ts'
 import { auditCoverage } from './iq/invariants.ts'
-import type { RunState, Task } from './iq/types.ts'
+import type { RawInput, RunState, Task } from './iq/types.ts'
 import type { ReconcileEvidence } from './reconcile.ts'
 
 export const name = 'dsh-instruction-queue'
@@ -922,15 +922,52 @@ export function apply(ctx: any, config: Config): void {
           // non-agent evidence; otherwise the run is BLOCKED, not completed.
           auditFailures = auditCoverage(next.state).filter((a) => !a.ok)
           if (auditFailures.length === 0) {
-            const comp: IQEvent = {
-              kind: 'RUN_COMPLETED',
-              seq: -1,
-              run_id: sessionId,
-              ts: nowIso(),
-              summary: approved.map((t) => ({ task_id: t.task_id, resolution_status: t.resolution_status })),
+            // LIVE INTAKE DELTA: if the plan finished executing every approved
+            // obligation but the user added NEW inputs while it ran (Pending
+            // Delta), do NOT complete yet — compile the delta into fresh
+            // PROPOSED obligations and enter awaiting_approval, so the run
+            // continues with the user's late intent (invariant #4: nothing new
+            // executes without approval). Only when no delta remains do we
+            // write RUN_COMPLETED.
+            const pending = pendingDeltaInputs(next.state)
+            if (pending.length > 0) {
+              const reqEvt: IQEvent = {
+                kind: 'COMPILE_REQUESTED', seq: -1, run_id: sessionId, ts: nowIso(),
+                input_sequences: pending.map((i) => i.queue_sequence),
+              }
+              const afterReq = commitEvents(sessionId, next.events, [reqEvt])
+              const { compileQueue } = await import('./compile.ts')
+              const compiled = await compileQueue(ctx, exec.agent, afterReq.state, config)
+              if (compiled !== null && compiled.tasks.length > 0) {
+                const compiledEvt: IQEvent = {
+                  kind: 'QUEUE_COMPILED', seq: -1, run_id: sessionId, ts: nowIso(),
+                  tasks: compiled.tasks, conflicts: compiled.conflicts,
+                  dependency_cycles: compiled.dependency_cycles, ambiguities: compiled.ambiguities,
+                }
+                const afterCompiled = commitEvents(sessionId, afterReq.events, [compiledEvt])
+                message = `All ${approved.length} approved obligation(s) resolved and coverage passed, but the user added `
+                  + `${pending.length} new instruction(s) during execution (live intake). They were compiled into `
+                  + `${compiled.tasks.length} proposed delta obligation(s) — phase ${afterCompiled.state.phase}. ` 
+                  + 'Review and approve with iq_approve to continue.'
+              } else {
+                // Compile failed (LLM/validation) — still complete the current
+                // approved work; the late inputs remain buffered for the user.
+                const comp: IQEvent = {
+                  kind: 'RUN_COMPLETED', seq: -1, run_id: sessionId, ts: nowIso(),
+                  summary: approved.map((t) => ({ task_id: t.task_id, resolution_status: t.resolution_status })),
+                }
+                const final = commitEvents(sessionId, afterReq.events, [comp])
+                message = `Current obligations completed, but ${pending.length} live input(s) could not be compiled — `
+                  + `queue COMPLETED (phase ${final.state.phase}); the buffered inputs remain for a new run.`
+              }
+            } else {
+              const comp: IQEvent = {
+                kind: 'RUN_COMPLETED', seq: -1, run_id: sessionId, ts: nowIso(),
+                summary: approved.map((t) => ({ task_id: t.task_id, resolution_status: t.resolution_status })),
+              }
+              const final = commitEvents(sessionId, next.events, [comp])
+              message = `All ${approved.length} approved obligation(s) resolved AND final coverage audit passed — queue COMPLETED (phase ${final.state.phase}).`
             }
-            const final = commitEvents(sessionId, next.events, [comp])
-            message = `All ${approved.length} approved obligation(s) resolved AND final coverage audit passed — queue COMPLETED (phase ${final.state.phase}).`
           } else {
             const blocked: IQEvent = {
               kind: 'QUEUE_BLOCKED',
@@ -1006,12 +1043,18 @@ export function apply(ctx: any, config: Config): void {
         const sessionId = String(id)
         const run = runs.get(sessionId)
         if (run === undefined || !run.state.enabled) return next()
-        if (run.state.phase !== 'collecting') return next() // only while collecting
+        // LIVE INTAKE: capture user text inputs during ANY in-progress phase
+        // (collecting, executing, reconciling, compiling, awaiting_approval) —
+        // "collection never closes". During execution this is a Pending Delta:
+        // it is buffered, does NOT mutate the running attempt (immutable
+        // execution envelope), and is merged at the reconciliation barrier.
+        // Completed/aborted runs no longer accept new queue inputs.
+        if (run.state.phase === 'completed' || run.state.phase === 'aborted') return next()
         if (messages === undefined || messages.length === 0) return next()
 
         // Only human user text messages are capture candidates. Plugin/system
-        // sources (schedule wakes, injected context) and non-text content
-        // (images/files) always pass through untouched.
+        // sources (schedule wakes, injected context, our own push envelopes)
+        // and non-text content (images/files) always pass through untouched.
         const batch = [...messages]
         if (!batch.every((m) => isCaptureCandidate(m))) return next()
 
@@ -1037,7 +1080,7 @@ export function apply(ctx: any, config: Config): void {
         }))
         commitEvents(sessionId, run.events, evts)
         // eslint-disable-next-line no-console
-        console.log(`[dsh-instruction-queue] autoCapture buffered ${texts.length} input(s) (phase=collecting)`)
+        console.log(`[dsh-instruction-queue] live intake buffered ${texts.length} input(s) (phase=${run.state.phase})`)
         // Empty enter → turn closes with no model call; nothing executed.
         return { kind: 'enter', messages: [] }
       } catch (e) {
@@ -1079,6 +1122,20 @@ function isControlUtterance(text: string): boolean {
   return /^\/iq\b/i.test(t)
     || /^(开始|开始吧|开始执行|编译|批准|审批|暂停|继续|停止|终止|状态|进度)$/.test(t)
     || /^(start|compile|approve|pause|resume|abort|status|go)$/i.test(t)
+}
+
+/**
+ * LIVE INTAKE delta: inputs the user added WHILE the plan was executing that
+ * have not yet been consumed by any task (approved or proposed). These are the
+ * "Pending Delta" merged at the reconciliation barrier — they do not touch the
+ * immutable running attempt, and become PROPOSED obligations needing approval.
+ */
+export function pendingDeltaInputs(state: RunState): RawInput[] {
+  const used = new Set<string>()
+  for (const t of state.tasks) {
+    for (const sid of t.source_input_ids) used.add(sid)
+  }
+  return state.inputs.filter((i) => !used.has(i.input_id))
 }
 
 /** Build the model-facing execution envelope for a dispatched task. */
