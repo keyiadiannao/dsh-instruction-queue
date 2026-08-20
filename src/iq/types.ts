@@ -1,8 +1,7 @@
 /**
  * dsh-instruction-queue — domain types.
  *
- * The event-sourced obligation orchestrator's vocabulary, frozen at
- * design round 3 (see docs/dev/DSH_PROMPT_SEQUENCE_DESIGN_2026-08-20.md).
+ * The event-sourced obligation orchestrator's vocabulary.
  *
  * Conventions:
  *  - Ledger (events.ndjson) is the single source of truth. RunState is a

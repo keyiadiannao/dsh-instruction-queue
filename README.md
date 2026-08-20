@@ -93,10 +93,10 @@ Restart the harness. The plugin registers seven tools: `iq_enable`,
 
 ## Design
 
-The design is frozen in [`docs/DESIGN.md`](docs/DESIGN.md) (6 rounds of review;
-state machine, dual status enums, reconcile boundary, immutable revision
-boundary, at-most-once retry, coverage judgment, crash recovery matrix, 9
-System Invariants).
+The plugin is an event-sourced obligation orchestrator guided by a set of
+System Invariants (state machine, dual status enums, reconcile boundary,
+immutable revision boundary, at-most-once retry, coverage judgment, crash
+recovery matrix, ledger-single-source-of-truth).
 
 Architecture: `src/iq/{types,events,reducer,recovery,invariants,ledger,schema}.ts` —
 pure protocol layer, no LLM/IO; `src/compile.ts` + `src/reconcile.ts` — lazy

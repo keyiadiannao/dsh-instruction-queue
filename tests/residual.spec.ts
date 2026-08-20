@@ -127,7 +127,7 @@ describe('residual authorization (P0-4)', () => {
   })
 
   it('father partial + pending residual → dispatches the residual, NOT the father again', () => {
-    // GPT review P0#4: the parent sits earlier in state.tasks than its
+    // P0#4 residual priority: the parent sits earlier in state.tasks than its
     // residual, so nextDispatchable used to re-run the parent (finished+partial)
     // before the residual. Residual must win — it owns the remaining work.
     let s = reduce(initialRunState('R1', SID), base())
