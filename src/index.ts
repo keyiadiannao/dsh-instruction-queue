@@ -37,7 +37,7 @@ import type { ReconcileEvidence } from './reconcile.ts'
 
 export const name = 'dsh-instruction-queue'
 
-export const inject = ['tools', 'llm']
+export const inject = ['tools', 'llm', 'webServer']
 
 /** Plugin configuration. */
 export interface Config {
@@ -132,6 +132,40 @@ export function apply(ctx: any, config: Config): void {
   }
 
   const nowIso = () => new Date().toISOString()
+
+  // ── HTTP status surface (for the client plan panel) ──────────────────────
+  // GET /api/dsh-instruction-queue/status?sessionId=... → serializable
+  // projection of the run state the client renders. Loopback-only trust fence.
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'prefix',
+    path: '/api/dsh-instruction-queue/status',
+    handler: async (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => {
+      const address = req.socket?.remoteAddress
+      if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: 'forbidden: non-loopback' }))
+        return
+      }
+      try {
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const sessionId = url.searchParams.get('sessionId') ?? ''
+        if (sessionId === '') {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: 'missing sessionId' }))
+          return
+        }
+        const run = loadRun(sessionId)
+        const body = run === null
+          ? { ok: true, active: false }
+          : { ok: true, active: true, state: projectForClient(run.state) }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(body))
+      } catch (e) {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : 'bad request' }))
+      }
+    },
+  }), 'dsh-instruction-queue: status route')
 
   // ── iq_status ────────────────────────────────────────────────────────────
   ctx.tools.register(
@@ -1007,4 +1041,49 @@ function isControlUtterance(text: string): boolean {
   return /^\/iq\b/i.test(t)
     || /^(开始|开始吧|开始执行|编译|批准|审批|暂停|继续|停止|终止|状态|进度)$/.test(t)
     || /^(start|compile|approve|pause|resume|abort|status|go)$/i.test(t)
+}
+
+/**
+ * Serialize a RunState for the client plan panel. Everything here is derived
+ * from the ledger projection; the client never reads the raw ledger (which
+ * may reference absolute paths / session internals).
+ */
+export function projectForClient(s: RunState): unknown {
+  return {
+    run_id: s.run_id,
+    session_id: s.session_id,
+    phase: s.phase,
+    enabled: s.enabled,
+    recovery_note: s.recovery_note,
+    completed_at: s.completed_at,
+    aborted_at: s.aborted_at,
+    inputs: s.inputs.map((i) => ({ input_id: i.input_id, content: i.content, queue_sequence: i.queue_sequence })),
+    tasks: s.tasks.map((t) => ({
+      task_id: t.task_id,
+      approval_status: t.approval_status,
+      origin: t.origin,
+      parent_task_id: t.parent_task_id,
+      task: t.task,
+      intent_type: t.intent_type,
+      targets: t.targets,
+      execution_status: t.execution_status,
+      resolution_status: t.resolution_status,
+      attempts: t.attempts.map((a) => ({
+        attempt_id: a.attempt_id,
+        status: a.status,
+        side_effect_observed: a.side_effect_observed,
+        evidence_ids: a.evidence_ids,
+      })),
+      acceptance_criteria: t.acceptance_criteria.map((c) => ({ criterion_id: c.criterion_id, text: c.text })),
+      side_effect_class: t.side_effect_class,
+      hard_dependencies: t.hard_dependencies,
+      soft_affinities: t.soft_affinities,
+      approved_task_revision: t.approved_task_revision,
+      criteria_met: t.coverage.criteria_met,
+      resolution: t.resolution_status,
+    })),
+    conflicts: s.conflicts,
+    dependency_cycles: s.dependency_cycles,
+    ambiguities: s.ambiguities,
+  }
 }
