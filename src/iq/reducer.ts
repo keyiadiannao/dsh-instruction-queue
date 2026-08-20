@@ -398,14 +398,18 @@ export function allApprovedResolved(state: RunState): boolean {
   )
 }
 
-/** Find the next dispatchable task (topological, dependency-aware). */
+/**
+ * Find the next dispatchable task (topological, dependency-aware).
+ *
+ * RESIDUAL PRIORITY: when an approved task is partial/open and has residual
+ * carriers (origin 'residual' bounds the remaining work of its parent), we
+ * dispatch the RESIDUAL first — NOT re-run the parent. This keeps the design
+ * invariant that residuals are the execution carriers for the remaining part
+ * of an approved obligation, and prevents the bug where the parent (which sits
+ * earlier in `state.tasks`) is re-selected before its residual.
+ */
 export function nextDispatchable(state: RunState): Task | null {
   if (state.active_task_id !== null) return null // invariant #7
-  // Dispatchable = approved/executable task that is NOT yet resolved (open/
-  // partial) and not running. A finished-but-open task (reconcile returned
-  // partial/open because criteria weren't fully met) may be re-dispatched for
-  // another attempt — this lets the executor keep working a partially-satisfied
-  // obligation to completion instead of getting stuck.
   const candidates = executableTasks(state).filter((t) =>
     (t.execution_status === 'pending' || t.execution_status === 'failed')
     || (t.execution_status === 'finished' && (t.resolution_status === 'open' || t.resolution_status === 'partial')),
@@ -415,7 +419,21 @@ export function nextDispatchable(state: RunState): Task | null {
       .filter((t) => t.resolution_status === 'satisfied' || t.resolution_status === 'covered')
       .map((t) => t.task_id),
   )
-  for (const t of candidates) {
+  // 1) Residual carriers (pending/failed) rank before their parents: they are
+  //    the remaining-work carriers, so dispatch them first.
+  const parentsWithOpenResidual = new Set(
+    candidates.filter((t) => t.execution_status === 'pending' && t.origin === 'residual').map((t) => t.parent_task_id),
+  )
+  const ordered = [
+    ...candidates.filter((t) => t.origin === 'residual' && t.execution_status === 'pending'),
+    // Parents whose still-open remaining work is fully delegated to a residual
+    // are NOT re-dispatched (the residual owns it); parents with no residual
+    // keep working directly.
+    ...candidates.filter((t) => t.origin !== 'residual' && !(t.execution_status === 'finished'
+      && (t.resolution_status === 'partial' || t.resolution_status === 'open')
+      && parentsWithOpenResidual.has(t.task_id))),
+  ]
+  for (const t of ordered) {
     const depsMet = t.hard_dependencies.every((d) => resolvedIds.has(d))
     if (depsMet) return t
   }

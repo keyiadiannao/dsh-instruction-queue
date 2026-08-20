@@ -1079,6 +1079,11 @@ export function apply(ctx: any, config: Config): void {
           evidence: evtCap.evidence as ReconcileEvidence[],
           criteria: Array.isArray(args.criteria) ? args.criteria : undefined,
         })
+        // Parent task, when the reconciled task is a residual carrier (so its
+        // satisfied criteria can propagate back to the parent obligation).
+        const parent = task.parent_task_id !== null
+          ? captured.state.tasks.find((t) => t.task_id === task.parent_task_id)
+          : undefined
 
         const evts: IQEvent[] = [
           {
@@ -1100,6 +1105,26 @@ export function apply(ctx: any, config: Config): void {
             criterion_id: c.criterion_id,
             evidence_refs: c.evidence_refs,
           })),
+          // RESIDUAL EVIDENCE PROPAGATION to parent: a residual is the execution
+          // carrier for the REMAINING part of its parent approved obligation.
+          // Its satisfied criteria therefore also advance the PARENT's coverage
+          // on the corresponding parent AC (derived_from_criteria maps residual
+          // work back to the parent's approved criteria). This prevents the
+          // parent from staying partial/open forever while its residual did the
+          // actual work.
+          ...(task.origin === 'residual' && task.parent_task_id !== null && parent
+            ? rec.criteria_met
+              .filter((c) => task.derived_from_criteria.includes(c.criterion_id) || parent.acceptance_criteria.some((ac) => ac.criterion_id === c.criterion_id))
+              .map((c) => ({
+                kind: 'TASK_CRITERION_SATISFIED' as const,
+                seq: -1,
+                run_id: sessionId,
+                ts: nowIso(),
+                task_id: task.parent_task_id as string,
+                criterion_id: c.criterion_id,
+                evidence_refs: c.evidence_refs,
+              }))
+            : []),
           {
             kind: 'TASK_COVERED',
             seq: -1,

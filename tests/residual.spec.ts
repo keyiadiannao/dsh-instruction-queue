@@ -102,8 +102,7 @@ describe('residual authorization (P0-4)', () => {
     expect(next?.task_id).toBe('T1.R1')
   })
 
-  it('residual is NOT an approved obligation (excluded from denominator)', () => {
-    let s = reduce(initialRunState('R1', SID), base())
+  it('residual is NOT an approved obligation (excluded from denominator)', () => {    let s = reduce(initialRunState('R1', SID), base())
     s = reduce(s, input(1))
     s = reduce(s, compiled(2))
     s = reduce(s, approved(3))
@@ -125,6 +124,26 @@ describe('residual authorization (P0-4)', () => {
     expect(s.phase).toBe('awaiting_approval')
     // Expansion is not executable pre-approval (not in the executable set).
     expect(executableTasks(s).map((t) => t.task_id)).not.toContain('T1.X1')
+  })
+
+  it('father partial + pending residual → dispatches the residual, NOT the father again', () => {
+    // GPT review P0#4: the parent sits earlier in state.tasks than its
+    // residual, so nextDispatchable used to re-run the parent (finished+partial)
+    // before the residual. Residual must win — it owns the remaining work.
+    let s = reduce(initialRunState('R1', SID), base())
+    s = reduce(s, input(1))
+    s = reduce(s, compiled(2))
+    s = reduce(s, approved(3))
+    // T1 finishes PARTIAL (not all ACs met) → reconcile proposes residual T1.R1.
+    s = reduce(s, residualProposal(4))
+    // Mark T1 finished+partial (its remaining work is now owned by T1.R1).
+    s = reduce(s, { kind: 'TASK_DISPATCHED', seq: 5, run_id: 'R1', ts: 't', task_id: 'T1', attempt_id: 'A1' })
+    s = reduce(s, { kind: 'ATTEMPT_RESULT_CAPTURED', seq: 6, run_id: 'R1', ts: 't', task_id: 'T1', attempt_id: 'A1', result_summary: 'partial', evidence: [] })
+    s = reduce(s, { kind: 'ATTEMPT_COMMITTED', seq: 7, run_id: 'R1', ts: 't', task_id: 'T1', attempt_id: 'A1', attempt_status: 'finished', task_execution_status: 'finished' })
+    s = reduce(s, { kind: 'TASK_COVERED', seq: 8, run_id: 'R1', ts: 't', task_id: 'T1', resolution_status: 'partial', note: 'remaining owned by residual' })
+    const next = nextDispatchable(s)
+    // Parent T1 is finished+partial with an open residual → residual T1.R1 wins.
+    expect(next?.task_id).toBe('T1.R1')
   })
 })
 
