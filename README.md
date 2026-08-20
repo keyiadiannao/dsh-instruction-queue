@@ -68,6 +68,7 @@ Restart the harness. The plugin registers seven tools: `iq_enable`,
 | `llmProvider` / `llmModel` | `''` (session default) | Provider/model for compile + reconcile semantic calls |
 | `allowPartialApproval` | `true` | When `false`, `iq_approve` requires whole-queue approval |
 | `maxCompiledTasks` | `12` | Compiler warns when the proposal exceeds this many tasks |
+| `autoCapture` | `false` | When `true` and the run is collecting, normal user inputs are intercepted at `agent/pre-step` and buffered instead of executed — the queue becomes a real input routing state. Control utterances (`/iq …`, 开始/编译/批准/…) pass through. Default off (tool-driven loop is the V1 behavior) |
 
 ## Usage (tool loop)
 

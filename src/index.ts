@@ -50,6 +50,14 @@ export interface Config {
   allowPartialApproval: boolean
   /** Max tasks in one compiled queue before the compiler warns. */
   maxCompiledTasks: number
+  /**
+   * When true (and the run is collecting), normal user inputs are
+   * intercepted at agent/pre-step and buffered instead of executed —
+   * the queue becomes a real input routing state. Control utterances
+   * (start/compile/approve/abort) pass through. Default false: the
+   * tool-driven loop (iq_collect) is the V1 behavior.
+   */
+  autoCapture: boolean
 }
 
 /** Schemastery schema; cordis validates and provides it as apply(ctx, config). */
@@ -60,6 +68,7 @@ export const Config: z<Config> = z.object({
   llmModel: z.string().default(''),
   allowPartialApproval: z.boolean().default(true),
   maxCompiledTasks: z.number().min(1).max(50).default(12),
+  autoCapture: z.boolean().default(false),
 })
 
 /** Resolve the ledger root: explicit config, else the portable default. */
@@ -898,9 +907,97 @@ export function apply(ctx: any, config: Config): void {
     },
     'dsh-instruction-queue: iq_reconcile',
   )
+
+  // ── autoCapture: queue mode as a real input routing state ────────────────
+  // When enabled and the run is collecting, intercept normal user inputs at
+  // agent/pre-step and buffer them (INPUT_BUFFERED) instead of executing.
+  // Returning an `enter` decision with ZERO messages makes the agent loop
+  // close the turn without a model call (agent-loop: step 0 + empty messages
+  // → turn completed), so the user sees "buffered", nothing runs.
+  // Control utterances pass through to the main agent (which drives the
+  // iq_* tools). Default off: the tool-driven loop is the V1 behavior.
+  if (config.autoCapture) {
+    ctx.on('agent/pre-step', async ({ agent, messages }: {
+      agent?: { session?: { id?: unknown } }
+      messages?: readonly { content?: unknown; source?: { kind?: string } }[]
+    }, next: () => Promise<unknown>): Promise<unknown> => {
+      try {
+        const id = agent?.session?.id
+        if (id === undefined || id === null) return next()
+        const sessionId = String(id)
+        const run = runs.get(sessionId)
+        if (run === undefined || !run.state.enabled) return next()
+        if (run.state.phase !== 'collecting') return next() // only while collecting
+        if (messages === undefined || messages.length === 0) return next()
+
+        // Only human user text messages are capture candidates. Plugin/system
+        // sources (schedule wakes, injected context) and non-text content
+        // (images/files) always pass through untouched.
+        const batch = [...messages]
+        if (!batch.every((m) => isCaptureCandidate(m))) return next()
+
+        const texts = batch.map(textOfMessage).filter((t) => t.length > 0)
+        if (texts.length === 0) return next()
+
+        // Control utterances are NOT captured — they pass to the agent, which
+        // routes them to the iq_* tools (start/compile/approve/…).
+        if (texts.every(isControlUtterance)) return next()
+
+        const startSeq = run.state.inputs.length
+        const ts = nowIso()
+        const evts: IQEvent[] = texts.map((content, i) => ({
+          kind: 'INPUT_BUFFERED' as const,
+          seq: -1,
+          run_id: sessionId,
+          ts,
+          input_id: `IN${startSeq + i + 1}`,
+          content,
+          queue_sequence: startSeq + i + 1,
+          last_visible_event_id: null,
+          session_id: sessionId,
+        }))
+        commitEvents(sessionId, run.events, evts)
+        // eslint-disable-next-line no-console
+        console.log(`[dsh-instruction-queue] autoCapture buffered ${texts.length} input(s) (phase=collecting)`)
+        // Empty enter → turn closes with no model call; nothing executed.
+        return { kind: 'enter', messages: [] }
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.log(`[dsh-instruction-queue] autoCapture error: ${e instanceof Error ? e.message : String(e)}`)
+        return next() // never break the agent loop
+      }
+    }, 'dsh-instruction-queue: autoCapture pre-step')
+  }
 }
 
 /** True when every approved obligation is resolved (completion gate). */
 function allResolved(state: RunState): boolean {
   return allApprovedResolved(state)
+}
+
+/** A capture candidate: human user source, text-only content. */
+function isCaptureCandidate(m: { content?: unknown; source?: { kind?: string } }): boolean {
+  if (m.source !== undefined && m.source.kind !== 'user') return false
+  const content = m.content
+  if (!Array.isArray(content)) return typeof content === 'string' || content === undefined
+  return content.every((b) => typeof b === 'object' && b !== null && (b as { type?: string }).type === 'text')
+}
+
+/** Plain text of one message's content blocks. */
+function textOfMessage(m: { content?: unknown }): string {
+  const content = m.content
+  if (!Array.isArray(content)) return String(content ?? '')
+  return content
+    .map((b) => typeof b === 'object' && b !== null && (b as { type?: string }).type === 'text'
+      ? (b as { text?: string }).text ?? ''
+      : '')
+    .join('\n')
+}
+
+/** Control utterances route to the queue tools instead of being buffered. */
+function isControlUtterance(text: string): boolean {
+  const t = text.trim()
+  return /^\/iq\b/i.test(t)
+    || /^(开始|开始吧|开始执行|编译|批准|审批|暂停|继续|停止|终止|状态|进度)$/.test(t)
+    || /^(start|compile|approve|pause|resume|abort|status|go)$/i.test(t)
 }
