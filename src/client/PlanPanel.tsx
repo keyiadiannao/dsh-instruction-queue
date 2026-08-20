@@ -89,6 +89,8 @@ interface PlanPanelProps {
 export function PlanPanel({ sessionId, closeDetails }: PlanPanelProps): JSX.Element {
   const [data, setData] = useState<StatusResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [frag, setFrag] = useState('')
+  const [capturing, setCapturing] = useState(false)
 
   useEffect(() => {
     if (!sessionId) return
@@ -108,14 +110,56 @@ export function PlanPanel({ sessionId, closeDetails }: PlanPanelProps): JSX.Elem
     return () => { cancelled = true; clearInterval(t) }
   }, [sessionId])
 
+  // Drop a fragmentary idea into live intake (pending delta), no execution.
+  async function capture(e: React.FormEvent) {
+    e.preventDefault()
+    const text = frag.trim()
+    if (!text || !sessionId) return
+    setCapturing(true)
+    try {
+      await fetch('/api/dsh-instruction-queue/capture', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId, content: text }),
+      })
+      setFrag('')
+      // nudge the poll to reflect the new pending input
+      setTimeout(() => {
+        if (!sessionId) return
+        fetch(`/api/dsh-instruction-queue/status?sessionId=${encodeURIComponent(sessionId)}`)
+          .then((r) => r.json() as Promise<StatusResponse>)
+          .then((d) => { setData(d) })
+      }, 300)
+    } catch (e2) {
+      setError(String(e2))
+    } finally {
+      setCapturing(false)
+    }
+  }
+
+  const activeCount = data?.active ? (data.state?.tasks.filter((t) => t.execution_status === 'running').length ?? 0) : 0
   const st = data?.state
   return (
     <aside style={rootStyle}>
       <header style={headerStyle}>
-        <strong style={titleStyle}>Instructions Queue</strong>
+        <strong style={titleStyle}>计划</strong>
+        {activeCount > 0 && <span style={activePillStyle}>▶ {activeCount} executing</span>}
         <button type="button" onClick={closeDetails} aria-label="close"
           style={closeBtnStyle}>✕</button>
       </header>
+
+      {/* Drop-a-fragment input: the zero-cost idea capture for live intake. */}
+      <form onSubmit={capture} style={captureFormStyle}>
+        <input
+          value={frag}
+          onChange={(e) => setFrag(e.target.value)}
+          placeholder="丢个想法… (加入计划，不打断)"
+          style={captureInputStyle}
+          disabled={!data?.active}
+        />
+        <button type="submit" disabled={!data?.active || !frag.trim() || capturing}
+          style={captureBtnStyle}>+</button>
+      </form>
 
       {error && <div style={errorStyle}>{error}</div>}
       {!data && !error && <div style={mutedStyle}>loading…</div>}
@@ -128,7 +172,7 @@ export function PlanPanel({ sessionId, closeDetails }: PlanPanelProps): JSX.Elem
             {st.recovery_note && <div style={warnStyle}>⚠ {st.recovery_note}</div>}
           </div>
 
-          <Section title={`Buffered inputs (${st.inputs.length})`}>
+          <Section title={`已缓冲想法 (${st.inputs.length})`}>
             {st.inputs.length === 0 && <div style={mutedStyle}>none</div>}
             {st.inputs.map((i) => (
               <div key={i.input_id} style={rowStyle}>
@@ -262,5 +306,20 @@ const warnRowStyle: React.CSSProperties = { color: '#f59e0b', fontSize: 12 }
 const errorStyle: React.CSSProperties = { color: '#ef4444', marginTop: 8 }
 const acStyle: React.CSSProperties = { marginTop: 4, borderTop: '1px solid #333', paddingTop: 4 }
 const acRowStyle: React.CSSProperties = { display: 'flex', gap: 6, alignItems: 'center' }
+const activePillStyle: React.CSSProperties = {
+  marginLeft: 'auto', marginRight: 8, background: '#0ea5e9', color: '#fff',
+  borderRadius: 10, padding: '0 8px', fontSize: 11, fontWeight: 600,
+}
+const captureFormStyle: React.CSSProperties = {
+  display: 'flex', gap: 6, marginBottom: 12,
+}
+const captureInputStyle: React.CSSProperties = {
+  flex: 1, background: '#333', border: '1px solid #444', color: '#eee',
+  borderRadius: 6, padding: '5px 8px', fontSize: 12, outline: 'none',
+}
+const captureBtnStyle: React.CSSProperties = {
+  background: '#0ea5e9', border: 'none', color: '#fff', borderRadius: 6,
+  width: 26, fontSize: 15, cursor: 'pointer', flexShrink: 0,
+}
 
 export default PlanPanel

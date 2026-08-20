@@ -382,6 +382,61 @@ export function apply(ctx: any, config: Config): void {
     },
   }), 'dsh-instruction-queue: status route')
 
+  // POST /api/dsh-instruction-queue/capture — capture a fragmentary idea into
+  // the plan's live intake (pending delta) WITHOUT executing anything. This is
+  // the "drop an idea anytime" input channel: the human types a short thought
+  // ("add caching", "swap DB"), it is recorded as INPUT_BUFFERED, and the
+  // reconcile barrier later compiles it into proposed plan changes. Loopback-
+  // only trust fence, same as status. Body: { sessionId, content }.
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'prefix',
+    path: '/api/dsh-instruction-queue/capture',
+    handler: async (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => {
+      const address = req.socket?.remoteAddress
+      if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: 'forbidden: non-loopback' }))
+        return
+      }
+      try {
+        const chunks: Buffer[] = []
+        let size = 0
+        for await (const chunk of req) {
+          size += chunk.length
+          if (size > 4096) { req.destroy(); res.writeHead(413, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'too large' })); return }
+          chunks.push(chunk as Buffer)
+        }
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as { sessionId?: string; content?: string }
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+        const content = typeof body.content === 'string' ? body.content.trim() : ''
+        if (sessionId === '' || content === '') {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: 'missing sessionId or content' }))
+          return
+        }
+        const run = loadRun(sessionId)
+        if (run === null || !run.state.enabled || run.state.phase === 'completed' || run.state.phase === 'aborted') {
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, captured: false, error: 'no active queue run' }))
+          return
+        }
+        const startSeq = run.state.inputs.length
+        const ts = nowIso()
+        const evt: IQEvent = {
+          kind: 'INPUT_BUFFERED', seq: -1, run_id: sessionId, ts,
+          input_id: `IN${startSeq + 1}`, content, queue_sequence: startSeq + 1,
+          last_visible_event_id: null, session_id: sessionId,
+        }
+        commitEvents(sessionId, run.events, [evt])
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, captured: true, input_id: `IN${startSeq + 1}`, total_inputs: startSeq + 1 }))
+      } catch (e) {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : 'bad request' }))
+      }
+    },
+  }), 'dsh-instruction-queue: capture route')
+
   // ── iq_status ────────────────────────────────────────────────────────────
   ctx.tools.register(
     {

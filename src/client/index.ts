@@ -18,6 +18,7 @@ import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import { PlanPanel } from './PlanPanel.tsx'
 import { PlanButton } from './PlanButton.tsx'
+import { PlanRail } from './PlanRail.tsx'
 
 /** Required services. */
 export const inject = ['slots', 'layout']
@@ -42,6 +43,12 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
       owner: {
         session: { id?: string; running?: boolean }
       }
+    }
+    /** Frame-wide floating layer above every column (additive). */
+    'shell.overlay': {
+      kind: 'list'
+      scope: 'root'
+      owner: Record<string, unknown>
     }
   }
 }
@@ -93,5 +100,17 @@ export function apply(ctx: ClientContext): void {
       locale: 'instructions.queue',
       inject: () => ({ openDetails: () => services.layout.openDetails() }),
     }, PlanButton),
+  )
+
+  // Persistent right-side rail (frame-wide additive layer): always-visible
+  // strip to open the plan panel even when details is collapsed.
+  services.slots.inject('shell.overlay', () =>
+    services.slots.register({
+      name: 'shell.overlay',
+      id: 'iq-plan-rail',
+      order: 1000,
+      locale: 'instructions.queue',
+      inject: () => ({ openDetails: () => services.layout.openDetails() }),
+    }, PlanRail),
   )
 }
