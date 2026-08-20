@@ -1,0 +1,70 @@
+{
+  "name": "dsh-instruction-queue",
+  "version": "0.1.0",
+  "description": "Persistent instruction queue for DeepSeek Harness: collect the user's multi-segment instructions into a collaborative plan, compile them into approved obligations, execute them segment-by-segment through the main agent session, and reconcile the plan after each segment against user intent, agent discoveries, and workspace state. Event-sourced obligation orchestrator.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "instruction-queue",
+    "obligation",
+    "event-sourcing",
+    "planning",
+    "reconciliation",
+    "human-on-the-loop",
+    "ai-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/keyiadiannao/dsh-instruction-queue.git"
+  },
+  "homepage": "https://github.com/keyiadiannao/dsh-instruction-queue",
+  "bugs": {
+    "url": "https://github.com/keyiadiannao/dsh-instruction-queue/issues"
+  },
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsdown -c tsdown.config.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit --pretty false",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.8",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsdown": "^0.22.2",
+    "typescript": "^5.6.0",
+    "vitest": "^3.2.4"
+  },
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,4 @@
+# dsh-instruction-queue bundle patch: mount into the profile.
+- insert:
+    - id: dsh-instruction-queue
+      name: 'dsh-instruction-queue'
